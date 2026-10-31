@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS chat_threads (
  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
  title TEXT NOT NULL DEFAULT 'New chat', active_campaign_id TEXT,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ deleted_at TEXT
 );
 CREATE TABLE IF NOT EXISTS messages (
  id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT NOT NULL REFERENCES conversations(id),
@@ -24,16 +25,37 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS campaigns (
  id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
  state TEXT NOT NULL, request_text TEXT NOT NULL, brief_json TEXT, result_json TEXT,
- created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ simulation_mode INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sellers (
  id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL REFERENCES campaigns(id), position INTEGER NOT NULL,
  business_name TEXT NOT NULL, phone_e164 TEXT, product_url TEXT, source_url TEXT,
- evidence TEXT, match_state TEXT NOT NULL DEFAULT 'unverified', excluded INTEGER NOT NULL DEFAULT 0
+ evidence TEXT, match_state TEXT NOT NULL DEFAULT 'unverified', excluded INTEGER NOT NULL DEFAULT 0,
+ call_mode TEXT NOT NULL DEFAULT 'bolna'
+);
+CREATE TABLE IF NOT EXISTS seller_directory (
+ id TEXT PRIMARY KEY, seller_key TEXT NOT NULL UNIQUE, business_name TEXT NOT NULL,
+ phone_e164 TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS seller_products (
+ id TEXT PRIMARY KEY, seller_directory_id TEXT NOT NULL REFERENCES seller_directory(id),
+ product_key TEXT NOT NULL, product_name TEXT NOT NULL, latest_quote_json TEXT,
+ latest_price REAL, latest_price_basis TEXT, latest_quote_call_id TEXT,
+ latest_quoted_at TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, UNIQUE(seller_directory_id, product_key)
+);
+CREATE TABLE IF NOT EXISTS seller_quote_history (
+ id TEXT PRIMARY KEY, seller_product_id TEXT NOT NULL REFERENCES seller_products(id),
+ campaign_id TEXT NOT NULL REFERENCES campaigns(id), campaign_seller_id TEXT NOT NULL REFERENCES sellers(id),
+ call_id TEXT NOT NULL UNIQUE REFERENCES calls(id), round INTEGER NOT NULL,
+ quote_json TEXT NOT NULL, price REAL, price_basis TEXT, previous_price REAL,
+ quoted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS calls (
  id TEXT PRIMARY KEY, campaign_id TEXT NOT NULL REFERENCES campaigns(id), seller_id TEXT NOT NULL REFERENCES sellers(id),
- round INTEGER NOT NULL, state TEXT NOT NULL, bolna_execution_id TEXT UNIQUE, transcript TEXT,
+ round INTEGER NOT NULL, retry_count INTEGER NOT NULL DEFAULT 0, retry_of_call_id TEXT,
+ state TEXT NOT NULL, bolna_execution_id TEXT UNIQUE, transcript TEXT,
  recording_url TEXT, recording_path TEXT, quote_json TEXT, started_at TEXT, completed_at TEXT
 );
 CREATE TABLE IF NOT EXISTS jobs (
@@ -55,7 +77,14 @@ function ensureColumn(table: string, column: string, definition: string) {
   if (!columns.some(item => item.name === column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }
 ensureColumn('messages', 'thread_id', 'TEXT REFERENCES chat_threads(id)');
+ensureColumn('chat_threads', 'deleted_at', 'TEXT');
 ensureColumn('campaigns', 'thread_id', 'TEXT REFERENCES chat_threads(id)');
+ensureColumn('campaigns', 'simulation_mode', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('calls', 'retry_count', 'INTEGER NOT NULL DEFAULT 0');
+ensureColumn('calls', 'retry_of_call_id', 'TEXT');
+ensureColumn('sellers', 'seller_directory_id', 'TEXT REFERENCES seller_directory(id)');
+ensureColumn('sellers', 'seller_product_id', 'TEXT REFERENCES seller_products(id)');
+ensureColumn('sellers', 'call_mode', "TEXT NOT NULL DEFAULT 'bolna'");
 
 // Keep existing demo data together as the first chat when upgrading an older database.
 const seedThreads = db.prepare(`INSERT INTO chat_threads(id,conversation_id,title,active_campaign_id)
@@ -66,11 +95,21 @@ db.exec(`UPDATE campaigns SET thread_id=(SELECT t.id FROM chat_threads t WHERE t
 UPDATE messages SET thread_id=(SELECT t.id FROM chat_threads t WHERE t.conversation_id=messages.conversation_id ORDER BY t.created_at LIMIT 1) WHERE thread_id IS NULL;
 CREATE INDEX IF NOT EXISTS messages_thread ON messages(thread_id, id);
 CREATE INDEX IF NOT EXISTS campaigns_thread ON campaigns(thread_id, created_at);`);
+db.exec(`CREATE INDEX IF NOT EXISTS seller_products_latest ON seller_products(seller_directory_id, latest_quoted_at);
+CREATE INDEX IF NOT EXISTS seller_quote_history_product ON seller_quote_history(seller_product_id, quoted_at DESC);`);
 
 export const id = () => crypto.randomUUID();
 export function enqueue(uniqueKey: string, kind: string, payload: unknown) {
   db.prepare(`INSERT OR IGNORE INTO jobs(unique_key,kind,payload) VALUES(?,?,?)`)
     .run(uniqueKey, kind, JSON.stringify(payload));
+}
+export function enqueueDelayed(uniqueKey: string, kind: string, payload: unknown, delayMinutes: number) {
+  db.prepare(`INSERT OR IGNORE INTO jobs(unique_key,kind,payload,due_at) VALUES(?,?,?,datetime('now',?))`)
+    .run(uniqueKey, kind, JSON.stringify(payload), `+${delayMinutes} minutes`);
+}
+export function enqueueDelayedSeconds(uniqueKey: string, kind: string, payload: unknown, delaySeconds: number) {
+  db.prepare(`INSERT OR IGNORE INTO jobs(unique_key,kind,payload,due_at) VALUES(?,?,?,datetime('now',?))`)
+    .run(uniqueKey, kind, JSON.stringify(payload), `+${Math.max(0, Math.floor(delaySeconds))} seconds`);
 }
 export function logMessage(conversationId: string, direction: 'in' | 'out', content: string, providerId?: string, threadId?: string) {
   db.prepare(`INSERT OR IGNORE INTO messages(conversation_id,direction,provider_message_id,content,thread_id) VALUES(?,?,?,?,?)`)
@@ -88,7 +127,7 @@ export function getConversation(buyer: string) {
 
 export function getChatOwner(buyer: string) {
   const conversation = getConversation(buyer);
-  let thread = db.prepare('SELECT * FROM chat_threads WHERE conversation_id=? ORDER BY created_at LIMIT 1').get(conversation.id) as any;
+  let thread = db.prepare('SELECT * FROM chat_threads WHERE conversation_id=? AND deleted_at IS NULL ORDER BY created_at LIMIT 1').get(conversation.id) as any;
   if (!thread) {
     const threadId = id();
     db.prepare('INSERT INTO chat_threads(id,conversation_id,title,active_campaign_id) VALUES(?,?,?,?)')
@@ -115,7 +154,7 @@ export function listChats(buyer: string) {
   return db.prepare(`SELECT t.id,t.title,t.created_at,t.updated_at,
     (SELECT request_text FROM campaigns c WHERE c.thread_id=t.id ORDER BY c.created_at LIMIT 1) AS product,
     (SELECT content FROM messages m WHERE m.thread_id=t.id AND m.direction='in' ORDER BY m.id LIMIT 1) AS first_message
-    FROM chat_threads t WHERE t.conversation_id=? ORDER BY t.updated_at DESC,t.created_at DESC`).all(conversation.id) as any[];
+    FROM chat_threads t WHERE t.conversation_id=? AND t.deleted_at IS NULL ORDER BY t.updated_at DESC,t.created_at DESC`).all(conversation.id) as any[];
 }
 
 export const newId = id;

@@ -1,4 +1,4 @@
-# Sauda: autonomous purchasing research and negotiation on WhatsApp
+# ezbz.ai: autonomous purchasing research and negotiation on WhatsApp
 
 > **Current direction:** The buyer interface is now a protected browser console; WhatsApp has been dropped. The original plan below is superseded where it describes the buyer channel. See [README.md](README.md) for the implemented flow.
 
@@ -25,10 +25,10 @@ The following is illustrative interaction design, not an actual product search, 
 Buyer:
 > Find the best price for this: [product link]. Two units, deliver to 560001.
 
-Sauda:
+ezbz.ai:
 > I'll check the exact product and find sellers who can deliver there.
 
-Sauda, after research:
+ezbz.ai, after research:
 > I found [brand + exact model], [selected colour/variant], new, quantity 2, delivery to 560001.
 >
 > 1. [Seller A] — exact product match — [product link]
@@ -41,13 +41,13 @@ Sauda, after research:
 Buyer:
 > Call them all.
 
-Sauda:
+ezbz.ai:
 > Calling all three. I'll bring you the best confirmed offer here.
 
-Sauda, at a meaningful intermediate milestone:
+ezbz.ai, at a meaningful intermediate milestone:
 > Two sellers have quoted. One cheaper listing was for a different variant, so I excluded it. I'm following up on the comparable offers.
 
-Sauda, after completion:
+ezbz.ai, after completion:
 > Best confirmed offer: [seller].
 > [Exact product, variant, quantity]
 > Total: ₹[amount], [confirmed GST and delivery treatment].
@@ -63,7 +63,7 @@ Sauda, after completion:
 Buyer, optionally:
 > Play Seller B's last call.
 
-Sauda sends that recording as playable WhatsApp audio and a short explanation of the agreed terms. Full transcripts are also available in the conversation.
+ezbz.ai sends that recording as playable WhatsApp audio and a short explanation of the agreed terms. Full transcripts are also available in the conversation.
 
 ## 3. Exactly two agent roles
 
@@ -374,7 +374,7 @@ Success: a buyer-selected product is researched automatically; at least two real
 Official buildathon: 31 October 2026 submission; 20 November finale. The form asks for a project description up to 200 characters, a submission link, and a pitch deck/video link. A website is not needed: a repository and WhatsApp demo video fit the listed options. No exact deadline time was stated on the public page.
 
 Suggested description:
-> Send a product on WhatsApp. Sauda researches Indian sellers, calls and negotiates in Hindi or English, and returns the best quote with recordings—without leaving the chat.
+> Send a product on WhatsApp. ezbz.ai researches Indian sellers, calls and negotiates in Hindi or English, and returns the best quote with recordings—without leaving the chat.
 
 Budget: three first calls of three minutes and three callbacks of two minutes is about 15 connected minutes before retries. Use the actual Bolna/telephony rates, plus research LLM/search, WhatsApp, number and hosting costs. Account permissions and recording/media access are first-milestone checks, not assumptions.
 

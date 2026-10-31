@@ -1,4 +1,4 @@
-# Sauda engineering plan: one server, SQLite, OpenAI, and Bolna
+# ezbz.ai engineering plan: one server, SQLite, OpenAI, and Bolna
 
 > **Current direction:** The buyer interface is now a protected browser console; WhatsApp has been dropped. The original plan below is superseded where it describes the buyer channel. See [README.md](README.md) for the implemented flow.
 
@@ -96,7 +96,7 @@ The coordinator is deterministic code. Do not give an LLM direct SQL, arbitrary 
       transitions.test.ts
       provider-events.test.ts
     data/                       Mounted persistent volume; ignored by Git
-      sauda.sqlite
+      ezbz.ai.sqlite
       recordings/<call-id>/
       research/<campaign-id>/
       transcripts/<call-id>.txt

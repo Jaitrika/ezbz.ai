@@ -1,4 +1,4 @@
-# Sauda
+# ezbz.ai
 
 Minimal web console for a single buyer to research products and run real supplier calls. The browser UI replaces the WhatsApp interface. OpenAI Responses API handles product research and quote extraction; Bolna handles live calls, call recordings, and transcripts. SQLite and a local persistent directory store campaigns and call artifacts.
 

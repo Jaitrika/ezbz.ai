@@ -1,4 +1,4 @@
-# Sauda: browser-console real-demo runbook
+# ezbz.ai: browser-console real-demo runbook
 
 > **Current direction:** The buyer uses the protected browser console; WhatsApp has been dropped. See [README.md](README.md) for the current E2E flow. Original WhatsApp-specific steps below are superseded.
 
@@ -6,7 +6,7 @@ Revised planning artifact. No bot has been deployed and no calls or messages hav
 
 ## The story
 
-“I send Sauda a product link on WhatsApp. Its research agent identifies the product and finds sellers. I say 'Call them all.' Its negotiation agent calls them in Hindi or English, negotiates across real quotes, and returns the best offer. I can listen to the calls without leaving WhatsApp.”
+“I send ezbz.ai a product link on WhatsApp. Its research agent identifies the product and finds sellers. I say 'Call them all.' Its negotiation agent calls them in Hindi or English, negotiates across real quotes, and returns the best offer. I can listen to the calls without leaving WhatsApp.”
 
 The viewer should see a normal WhatsApp conversation, not a separate buyer dashboard. A private developer console may help explain evidence or diagnose a problem, but it is not part of the buyer journey.
 
