@@ -1,0 +1,53 @@
+[
+  {
+    "name": "get_negotiation_brief",
+    "description": "Get the approved product, seller, call round, negotiation context, and stop state for this call.",
+    "endpoint": "/bolna/tools/get_negotiation_brief",
+    "parameters": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }
+  },
+  {
+    "name": "capture_quote",
+    "description": "Save the seller's provisional price and terms. Only report details the seller actually stated.",
+    "endpoint": "/bolna/tools/capture_quote",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "business_name": { "type": "string" },
+        "product_match": { "type": "string" },
+        "quantity": { "type": "string" },
+        "unit_price": { "type": ["number", "null"] },
+        "currency": { "type": "string" },
+        "gst": { "type": ["number", "null"] },
+        "shipping": { "type": ["number", "null"] },
+        "total": { "type": ["number", "null"] },
+        "delivery": { "type": ["string", "null"] },
+        "validity": { "type": ["string", "null"] },
+        "callback_permission": { "type": ["boolean", "null"] },
+        "evidence": { "type": "string" }
+      },
+      "required": ["business_name", "product_match", "quantity", "unit_price", "currency", "gst", "shipping", "total", "delivery", "validity", "callback_permission", "evidence"],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "next_negotiation_move",
+    "description": "Get the next approved negotiation question or benchmark instruction.",
+    "endpoint": "/bolna/tools/next_negotiation_move",
+    "parameters": { "type": "object", "properties": {}, "required": [], "additionalProperties": false }
+  },
+  {
+    "name": "record_followup",
+    "description": "Record whether the seller permits a callback, their preferred time, or a do-not-call request.",
+    "endpoint": "/bolna/tools/record_followup",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "callback_permission": { "type": "boolean" },
+        "callback_time": { "type": ["string", "null"] },
+        "do_not_call": { "type": "boolean" }
+      },
+      "required": ["callback_permission", "callback_time", "do_not_call"],
+      "additionalProperties": false
+    }
+  }
+]
