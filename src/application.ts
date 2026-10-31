@@ -6,13 +6,13 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import { config } from './config.js';
-import { db, enqueue, getChat, getChatOwner, logMessage, newId } from './db.js';
+import { db, enqueue, enqueueDelayed, getChat, getChatOwner, logMessage, newId } from './db.js';
+import { indexCampaignSeller, recordSellerQuote } from './seller-memory.js';
 import { researchProduct, extractQuote, understandBuyerMessage, type BuyerIntake } from './providers/openai.js';
 import { getExecution, startCall } from './providers/bolna.js';
 
 type Job = { id: number; unique_key: string; kind: string; payload: string; attempts: number };
 export type BuyerSellerContact = { business_name: string; phone_e164: string; product_url: string | null };
-
 export function parseBuyerSellerContacts(input: string): { sellers?: BuyerSellerContact[]; error?: string } {
   const lines = input.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
   if (lines.length > config.maxSellers) return { error: `Enter at most ${config.maxSellers} seller numbers.` };
@@ -36,6 +36,43 @@ export function parseBuyerSellerContacts(input: string): { sellers?: BuyerSeller
   return { sellers };
 }
 
+export function queueIndividualSellerCall(threadId: string, sellerId: string) {
+  const thread = db.prepare('SELECT * FROM chat_threads WHERE id=?').get(threadId) as any;
+  if (!thread?.active_campaign_id) throw new Error('This chat has no seller campaign.');
+  const campaign = campaignFor(thread.active_campaign_id);
+  if (!['shortlist_ready','collecting','renegotiating','result_ready'].includes(campaign.state)) {
+    throw new Error(`A seller call cannot be started while the campaign is ${campaign.state}.`);
+  }
+  const seller = db.prepare('SELECT * FROM sellers WHERE id=? AND campaign_id=? AND excluded=0').get(sellerId, campaign.id) as any;
+  if (!seller) throw new Error('Seller not found in this campaign.');
+  if (!seller.phone_e164 || !['verified','buyer_provided'].includes(seller.match_state)) throw new Error('This seller does not have a callable verified number.');
+  const inFlight = db.prepare(`SELECT id FROM calls WHERE campaign_id=? AND seller_id=?
+    AND state IN ('queued','calling','in_progress','retry_scheduled','dispatch_unknown') LIMIT 1`).get(campaign.id, seller.id);
+  if (inFlight) throw new Error('This seller already has a call in progress.');
+  const round = Number((db.prepare('SELECT COALESCE(MAX(round),0) AS round FROM calls WHERE campaign_id=?').get(campaign.id) as any).round) + 1;
+  const previousQuote = seller.seller_product_id
+    ? db.prepare('SELECT latest_quote_json FROM seller_products WHERE id=?').get(seller.seller_product_id) as any : null;
+  const best = campaign.result_json ? JSON.parse(campaign.result_json).best : null;
+  const context = round > 1 ? JSON.stringify({
+    benchmark: best?.quote?.total ?? null,
+    competitor: best?.seller ?? null,
+    previous_quote: previousQuote?.latest_quote_json ? JSON.parse(previousQuote.latest_quote_json) : null,
+  }) : null;
+  const callId = newId();
+  const tx = db.transaction(() => {
+    db.prepare(`INSERT INTO calls(id,campaign_id,seller_id,round,state,quote_json)
+      VALUES(?,?,?,?,'queued',?)`).run(callId, campaign.id, seller.id, round, context);
+    if (campaign.state === 'shortlist_ready' || campaign.state === 'result_ready') {
+      db.prepare("UPDATE campaigns SET state='collecting',result_json=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(campaign.id);
+    }
+    enqueue(`dispatch:${callId}`, 'dispatch_call', { callId });
+    logEvent('buyer', `individual-call:${callId}`, campaign.id, callId, 'seller_call_reauthorized', { sellerId: seller.id, round });
+    db.prepare("UPDATE chat_threads SET updated_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?").run(thread.id);
+  });
+  tx();
+  return { callId, round };
+}
+
 function fallbackBuyerIntake(message: string): BuyerIntake {
   const phonePattern = /(?:\+?91[\s.-]*)?([6-9](?:[\s.-]*\d){9})/g;
   const matches = [...message.matchAll(phonePattern)];
@@ -53,7 +90,7 @@ function fallbackBuyerIntake(message: string): BuyerIntake {
   const productSource = firstPhoneStart === undefined ? message : message.slice(0, firstPhoneStart);
   const productRequest = productSource.replace(/^new:\s*/i, '').replace(/(?:,?\s*(?:and\s+)?(?:call|contact|reach)\s+[^,.;\n]*)$/i, '')
     .replace(/\s+/g, ' ').replace(/[\s,;.-]+$/, '').trim();
-  const productLike = /\b(buy|buying|need|want|source|supplier|seller|product|quote|cotton|shirt|t-?shirt|order|quantity|gsm|delivery|deliver|negotiate)\b|https?:\/\//i.test(productRequest);
+  const productLike = /\b(buy|buying|need|want|source|supplier|seller|product|quote|cotton|shirt|t-?shirt|order|quantity|gsm|delivery|deliver|negotiate|parts?|headlight|tank|crash|guard|ktm|duke)\b|https?:\/\//i.test(productRequest);
   if (sellers.length && !productRequest) return { kind: 'needs_product_details', product_request: null, sellers, response: 'I have the seller contacts. What product and quantity should I discuss with them?' };
   if (productLike) return { kind: 'purchase_request', product_request: productRequest, sellers, response: null };
   return { kind: 'general_chat', product_request: null, sellers: [], response: 'OpenAI is temporarily rate-limited, so I cannot answer that right now. You can still send a product brief and seller phone numbers for me to prepare a call list.' };
@@ -61,6 +98,7 @@ function fallbackBuyerIntake(message: string): BuyerIntake {
 const say = async (conversationId: string, to: string, text: string, threadId?: string) => {
   void to;
   logMessage(conversationId, 'out', text, `ui-${newId()}`, threadId);
+  if (threadId) db.prepare("UPDATE chat_threads SET updated_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?").run(threadId);
 };
 const campaignFor = (id: string) => db.prepare('SELECT * FROM campaigns WHERE id=?').get(id) as any;
 const sellersFor = (id: string) => db.prepare('SELECT * FROM sellers WHERE campaign_id=? AND excluded=0 ORDER BY position').all(id) as any[];
@@ -88,7 +126,7 @@ export async function processBuyerMessage(buyer: string, text: string, messageId
   const lower = text.trim().toLowerCase();
   logMessage(conversation.id, 'in', text, messageId, thread.id);
   db.prepare('UPDATE conversations SET last_inbound_at=CURRENT_TIMESTAMP WHERE id=?').run(conversation.id);
-  db.prepare('UPDATE chat_threads SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(thread.id);
+  db.prepare("UPDATE chat_threads SET updated_at=strftime('%Y-%m-%d %H:%M:%f','now') WHERE id=?").run(thread.id);
   const campaignId = thread.active_campaign_id;
   if (/^(stop|pause|cancel)\b/.test(lower)) {
     if (campaignId) {
@@ -144,6 +182,34 @@ export async function processBuyerMessage(buyer: string, text: string, messageId
     db.prepare('UPDATE sellers SET excluded=1 WHERE id=?').run(seller.id);
     await say(conversation.id, buyer, `Excluded ${seller.business_name}. The remaining displayed sellers are unchanged; reply “Call them all” when ready.`, thread.id); return;
   }
+  if (/^(call (?:the )?sellers again|call again|redial)\b/.test(lower)) {
+    if (!campaignId) { await say(conversation.id, buyer, 'There is no previous seller campaign in this chat to call again.', thread.id); return; }
+    const campaign = campaignFor(campaignId);
+    if (campaign.state !== 'result_ready') { await say(conversation.id, buyer, `I can call these sellers again after this campaign is complete. Current status: ${campaign.state}.`, thread.id); return; }
+    const sellers = sellersFor(campaignId).filter(s => s.phone_e164 && ['verified', 'buyer_provided'].includes(s.match_state));
+    if (!sellers.length) { await say(conversation.id, buyer, 'There are no callable sellers in this campaign.', thread.id); return; }
+    const latestRound = (db.prepare('SELECT COALESCE(MAX(round),0) AS round FROM calls WHERE campaign_id=?').get(campaignId) as any).round as number;
+    const round = latestRound + 1;
+    const oldResult = campaign.result_json ? JSON.parse(campaign.result_json) : null;
+    const best = oldResult?.best && typeof oldResult.best.quote?.total === 'number' ? oldResult.best : null;
+    const tx = db.transaction(() => {
+      db.prepare("UPDATE campaigns SET state='collecting',result_json=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(campaignId);
+      for (const seller of sellers) {
+        const previous = db.prepare('SELECT quote_json FROM calls WHERE campaign_id=? AND seller_id=? AND quote_json IS NOT NULL ORDER BY round DESC LIMIT 1').get(campaignId, seller.id) as any;
+        let previousQuote: unknown = null;
+        try { previousQuote = previous?.quote_json ? JSON.parse(previous.quote_json) : null; } catch {}
+        const callId = newId();
+        const context = { benchmark: best?.quote.total ?? null, competitor: best?.seller ?? null, previous_quote: previousQuote };
+        db.prepare("INSERT INTO calls(id,campaign_id,seller_id,round,state,quote_json) VALUES(?,?,?,?,'queued',?)")
+          .run(callId, campaignId, seller.id, round, JSON.stringify(context));
+        enqueue(`dispatch:${callId}`, 'dispatch_call', { callId });
+      }
+      logEvent('buyer', `reauthorize:${campaignId}:${round}`, campaignId, null, 'calls_reauthorized', { messageId, round, sellerIds: sellers.map(s => s.id) });
+    });
+    tx();
+    const benchmarkText = best ? ` I will use the best confirmed quote, ₹${formatInr(best.quote.total)}, as a comparison where relevant.` : '';
+    await say(conversation.id, buyer, `Authorized another round. I am calling ${sellers.length} seller(s) again (round ${round}).${benchmarkText}`, thread.id); return;
+  }
   const correction = text.match(/^correct\s+(.+?)\s+(?:to\s+)?(?:₹|rs\.?\s*)\s*([\d,]+(?:\.\d{1,2})?)\s*$/i);
   if (correction && campaignId) {
     const sellerName = correction[1].trim().toLowerCase(); const amount = Number(correction[2].replace(/,/g, ''));
@@ -185,7 +251,7 @@ export async function processBuyerMessage(buyer: string, text: string, messageId
   const explicitNew = /^new:\s*/i.test(text.trim());
   const intakeText = text.replace(/^new:\s*/i, '').trim();
   const recent = db.prepare('SELECT direction,content FROM messages WHERE thread_id=? ORDER BY id DESC LIMIT 14').all(thread.id) as any[];
-  const history = recent.reverse().map(m => `${m.direction === 'in' ? 'buyer' : 'Sauda'}: ${m.content}`).join('\n');
+  const history = recent.reverse().map(m => `${m.direction === 'in' ? 'buyer' : 'ezbz.ai'}: ${m.content}`).join('\n');
   let intake: BuyerIntake;
   let usedFallback = false;
   try { intake = await understandBuyerMessage(intakeText, explicitNew ? '' : history); }
@@ -241,8 +307,12 @@ export async function processBuyerMessage(buyer: string, text: string, messageId
         .run(intake.product_request, JSON.stringify(brief), campaignId);
       const insert = db.prepare(`INSERT INTO sellers(id,campaign_id,position,business_name,phone_e164,product_url,source_url,evidence,match_state)
         VALUES(?,?,?,?,?,?,NULL,?,'buyer_provided')`);
-      newContacts.forEach((seller, i) => insert.run(newId(), campaignId, existing.length + i + 1, seller.business_name,
-        seller.phone_e164, seller.product_url, 'Phone number supplied by buyer; Sauda has not independently verified that it belongs to this seller.'));
+      newContacts.forEach((seller, i) => {
+        const sellerId = newId();
+        insert.run(sellerId, campaignId, existing.length + i + 1, seller.business_name,
+          seller.phone_e164, seller.product_url, 'Phone number supplied by buyer; ezbz.ai has not independently verified that it belongs to this seller.');
+        indexCampaignSeller(sellerId);
+      });
     });
     add();
     await say(conversation.id, buyer, `Updated the product brief and added ${newContacts.length} buyer-supplied seller contact(s). Review the shortlist, then choose “Call all sellers” when ready.`, thread.id);
@@ -255,8 +325,12 @@ export async function processBuyerMessage(buyer: string, text: string, messageId
       if (existing.length + newContacts.length <= config.maxSellers) {
         const insert = db.prepare(`INSERT INTO sellers(id,campaign_id,position,business_name,phone_e164,product_url,source_url,evidence,match_state)
           VALUES(?,?,?,?,?,?,NULL,?,'buyer_provided')`);
-        newContacts.forEach((seller, i) => insert.run(newId(), campaignId, existing.length + i + 1, seller.business_name,
-          seller.phone_e164, seller.product_url, 'Phone number supplied by buyer; Sauda has not independently verified that it belongs to this seller.'));
+        newContacts.forEach((seller, i) => {
+          const sellerId = newId();
+          insert.run(sellerId, campaignId, existing.length + i + 1, seller.business_name,
+            seller.phone_e164, seller.product_url, 'Phone number supplied by buyer; ezbz.ai has not independently verified that it belongs to this seller.');
+          indexCampaignSeller(sellerId);
+        });
         await say(conversation.id, buyer, `Added ${newContacts.length} buyer-supplied seller contact(s) to the shortlist being researched. I will not call until you authorize the completed shortlist.`, thread.id);
         return;
       }
@@ -279,8 +353,12 @@ function createCampaign(conversationId: string, threadId: string, buyer: string,
   if (sellerContacts.length) {
     const insert = db.prepare(`INSERT INTO sellers(id,campaign_id,position,business_name,phone_e164,product_url,source_url,evidence,match_state)
       VALUES(?,?,?,?,?,?,?,?, 'buyer_provided')`);
-    const add = db.transaction(() => sellerContacts.forEach((seller, i) => insert.run(newId(), campaignId, i + 1, seller.business_name,
-      seller.phone_e164, seller.product_url, null, 'Phone number supplied by buyer; Sauda has not independently verified that it belongs to this seller.')));
+    const add = db.transaction(() => sellerContacts.forEach((seller, i) => {
+      const sellerId = newId();
+      insert.run(sellerId, campaignId, i + 1, seller.business_name,
+        seller.phone_e164, seller.product_url, null, 'Phone number supplied by buyer; ezbz.ai has not independently verified that it belongs to this seller.');
+      indexCampaignSeller(sellerId);
+    }));
     add();
   } else enqueue(`research:${campaignId}`, 'research', { campaignId, buyer, conversationId, threadId, request });
   return campaignId;
@@ -293,6 +371,8 @@ async function doResearch(p: any) {
   const insert = db.prepare(`INSERT INTO sellers(id,campaign_id,position,business_name,phone_e164,product_url,source_url,evidence,match_state)
     VALUES(?,?,?,?,?,?,?,?,?)`);
   const add = db.transaction(() => {
+    db.prepare("UPDATE campaigns SET brief_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
+      .run(JSON.stringify({ product_summary: result.product_summary, product_attributes: result.product_attributes, missing_questions: result.missing_questions }), p.campaignId);
     result.sellers.slice(0, config.maxSellers).forEach((seller, i) => {
       let phone: string | null = null; let verified = false;
       if (seller.phone) {
@@ -301,15 +381,16 @@ async function doResearch(p: any) {
           phone = parsed.number; verified = true;
         }
       }
-      insert.run(newId(), p.campaignId, i + 1, seller.business_name, phone, seller.product_url,
-        seller.source_url, seller.evidence, verified ? 'verified' : 'unverified');
+      const sellerId = newId();
+      insert.run(sellerId, p.campaignId, i + 1, seller.business_name, phone, seller.product_url,
+        seller.source_url ?? null, seller.evidence, verified ? 'verified' : 'unverified');
+      indexCampaignSeller(sellerId);
     });
-    db.prepare("UPDATE campaigns SET state='shortlist_ready',brief_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?")
-      .run(JSON.stringify({ product_summary: result.product_summary, product_attributes: result.product_attributes, missing_questions: result.missing_questions }), p.campaignId);
+    db.prepare("UPDATE campaigns SET state='shortlist_ready',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(p.campaignId);
   });
   add();
   const sellers = sellersFor(p.campaignId);
-  const list = sellers.map((s, i) => `${i + 1}. ${s.business_name}${s.match_state === 'verified' ? ` — ${s.phone_e164}` : ' — phone not verified; will not call'}\n   Product: ${s.product_url ?? 'not provided'}\n   Source: ${s.source_url}\n   Evidence: ${s.evidence}`).join('\n\n');
+  const list = sellers.map((s, i) => `${i + 1}. ${s.business_name}${s.match_state === 'verified' || s.match_state === 'buyer_provided' ? ` — ${s.phone_e164}` : ' — phone not verified; will not call'}\n   Product: ${s.product_url ?? 'not provided'}\n   Source: ${s.source_url ?? 'not provided'}\n   Evidence: ${s.evidence}`).join('\n\n');
   const questions = result.missing_questions.length ? `\n\nNeed to know: ${result.missing_questions.join('; ')}` : '';
   await say(p.conversationId, p.buyer, `I researched your request.\n\nProduct: ${result.product_summary}\nDetails: ${result.product_attributes.join(', ') || 'not confirmed'}\n\nSellers:\n${list || 'No sellers with usable source evidence were found.'}${questions}\n\nReply “Call them all” to authorize calls to the sellers with verified phone numbers.`, p.threadId);
 }
@@ -318,14 +399,14 @@ async function dispatchCall(p: any) {
   const call = db.prepare(`SELECT calls.*, sellers.business_name,sellers.phone_e164,sellers.product_url,sellers.evidence,
     campaigns.brief_json,campaigns.request_text,campaigns.state AS campaign_state FROM calls
     JOIN sellers ON sellers.id=calls.seller_id JOIN campaigns ON campaigns.id=calls.campaign_id WHERE calls.id=?`).get(p.callId) as any;
-  if (!call || call.campaign_state !== 'collecting' || !call.phone_e164) return;
+  if (!call || !['collecting','renegotiating'].includes(call.campaign_state) || !call.phone_e164) return;
   db.prepare("UPDATE calls SET state='calling',started_at=CURRENT_TIMESTAMP WHERE id=?").run(call.id);
   try {
     const resp = await startCall(call.phone_e164, {
       app_call_id: call.id, campaign_id: call.campaign_id, seller_name: call.business_name,
       purchase_request: call.request_text, product_brief: call.brief_json,
       product_url: call.product_url, seller_evidence: call.evidence,
-      round: call.round, benchmark: call.round === 2 ? call.quote_json : null,
+      round: call.round, benchmark: call.round > 1 ? call.quote_json : null,
       language_instruction: 'Speak naturally in Hindi or English. Detect the seller\'s language and respond in that language; switch when the seller switches.',
       negotiation_rules: 'Identify yourself as an AI calling for a buyer. Confirm exact item, variant, quantity and availability. Ask for item price, GST, shipping, delivery, validity and invoice terms separately. Never invent a competing quote or make a purchase commitment. Ask for their best genuine price; quote a competitor only when benchmark data is supplied. Ask permission for a follow-up. End politely.',
     });
@@ -338,7 +419,7 @@ async function dispatchCall(p: any) {
     db.prepare('UPDATE calls SET state=? WHERE id=?').run(definitiveRejection ? 'failed' : 'dispatch_unknown', call.id);
     logEvent('app', `call-dispatch-error:${call.id}`, call.campaign_id, call.id,
       definitiveRejection ? 'call_failed' : 'call_dispatch_unknown', { error: String(error) });
-    enqueue(`advance:${call.campaign_id}:dispatch-error:${call.round}`, 'advance_campaign', { campaignId: call.campaign_id });
+    enqueue(`advance:${call.id}:dispatch-error`, 'advance_campaign', { campaignId: call.campaign_id });
   }
 }
 
@@ -367,8 +448,18 @@ export async function processBolnaWebhook(body: any) {
     : eventName.includes('fail') ? 'failed' : undefined;
   if (state) {
     db.prepare(`UPDATE calls SET state=?,completed_at=CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE completed_at END
-      WHERE id=? AND state NOT IN ('completed','failed','busy','no_answer')`)
+      WHERE id=? AND state NOT IN ('completed','failed','busy','no_answer','retry_scheduled')`)
       .run(state, terminal.includes(state) ? 1 : 0, call.id);
+  }
+  if (state === 'busy' && !['completed','failed','busy','no_answer','retry_scheduled'].includes(call.state)) {
+    const retriesUsed = Number(call.retry_count ?? 0);
+    if (retriesUsed < 3) {
+      const delayMinutes = 2 ** (retriesUsed + 1);
+      db.prepare("UPDATE calls SET state='retry_scheduled' WHERE id=?").run(call.id);
+      enqueueDelayed(`busy-retry:${call.id}`, 'retry_busy_call', { callId: call.id }, delayMinutes);
+      logEvent('app', `busy-retry-scheduled:${call.id}`, call.campaign_id, call.id, 'busy_retry_scheduled', { retry: retriesUsed + 1, delay_minutes: delayMinutes });
+      return;
+    }
   }
   const transcript = body.transcript ?? body.data?.transcript ?? body.execution?.transcript ?? body.data?.execution?.transcript;
   const recordingUrl = body.recording_url ?? body.data?.recording_url ?? body.telephony_data?.recording_url
@@ -376,7 +467,29 @@ export async function processBolnaWebhook(body: any) {
   if (transcript || recordingUrl) db.prepare('UPDATE calls SET transcript=COALESCE(?,transcript),recording_url=COALESCE(?,recording_url) WHERE id=?')
     .run(transcript ? String(transcript) : null, recordingUrl ? String(recordingUrl) : null, call.id);
   if (state === 'completed' || eventName.includes('disconnect')) enqueue(`reconcile:${call.id}`, 'reconcile_call', { callId: call.id });
-  else if (state && terminal.includes(state)) enqueue(`advance:${call.campaign_id}:${call.round}`, 'advance_campaign', { campaignId: call.campaign_id });
+  else if (state && terminal.includes(state)) enqueue(`advance:${call.id}:webhook`, 'advance_campaign', { campaignId: call.campaign_id });
+}
+
+async function retryBusyCall(p: any) {
+  const call = db.prepare(`SELECT calls.*, campaigns.state AS campaign_state FROM calls
+    JOIN campaigns ON campaigns.id=calls.campaign_id WHERE calls.id=?`).get(p.callId) as any;
+  if (!call || call.state !== 'retry_scheduled') return;
+  if (!['collecting','renegotiating'].includes(call.campaign_state)) {
+    db.prepare("UPDATE calls SET state='busy' WHERE id=? AND state='retry_scheduled'").run(call.id);
+    return;
+  }
+  const retryCount = Number(call.retry_count ?? 0) + 1;
+  const retryCallId = newId();
+  const tx = db.transaction(() => {
+    db.prepare("UPDATE calls SET state='busy' WHERE id=? AND state='retry_scheduled'").run(call.id);
+    db.prepare(`INSERT INTO calls(id,campaign_id,seller_id,round,retry_count,retry_of_call_id,state,quote_json)
+      VALUES(?,?,?,?,?,?,'queued',?)`).run(retryCallId, call.campaign_id, call.seller_id, call.round, retryCount,
+        call.id, call.quote_json);
+    enqueue(`dispatch:${retryCallId}`, 'dispatch_call', { callId: retryCallId });
+    logEvent('app', `busy-retry-started:${call.id}:${retryCount}`, call.campaign_id, retryCallId,
+      'busy_retry_started', { retry: retryCount, retry_of_call_id: call.id });
+  });
+  tx();
 }
 
 async function doReconcile(p: any) {
@@ -396,6 +509,7 @@ async function doReconcile(p: any) {
       const quoteText = await extractQuote(String(transcript), campaign.brief_json ?? campaign.request_text);
       let quote: any; try { quote = JSON.parse(quoteText); } catch { quote = { raw: quoteText }; }
       db.prepare('UPDATE calls SET quote_json=? WHERE id=?').run(JSON.stringify(quote), call.id);
+      recordSellerQuote(call.id, quote);
     } catch (e) { db.prepare('UPDATE calls SET quote_json=? WHERE id=?').run(JSON.stringify({ extraction_error: String(e) }), call.id); }
   }
   if (recordingUrl && !call.recording_path) {
@@ -413,13 +527,15 @@ async function doReconcile(p: any) {
       .run(`reconcile:${call.id}:retry:${retry}`, 'reconcile_call', JSON.stringify({ callId: call.id, retry }), `+${retry * 15} seconds`);
     return;
   }
-  enqueue(`advance:${call.campaign_id}:${call.round}`, 'advance_campaign', { campaignId: call.campaign_id });
+  enqueue(`advance:${call.id}:reconciled:${Date.now()}`, 'advance_campaign', { campaignId: call.campaign_id });
 }
 
 async function advanceCampaign(p: any) {
   const campaign = campaignFor(p.campaignId); if (!campaign || ['paused','result_ready'].includes(campaign.state)) return;
+  const terminalStates = ['completed','failed','busy','no_answer','cancelled','dispatch_unknown'];
+  const allCalls = callsFor(p.campaignId);
+  if (allCalls.some(c => !terminalStates.includes(c.state))) return;
   const first = callsFor(p.campaignId, 1);
-  if (first.some(c => !['completed','failed','busy','no_answer','cancelled','dispatch_unknown'].includes(c.state))) return;
   const second = callsFor(p.campaignId, 2);
   if (!second.length) {
     const quoted = first.filter(c => c.quote_json && !JSON.parse(c.quote_json).extraction_error);
@@ -440,8 +556,8 @@ async function advanceCampaign(p: any) {
       }
     }
     db.prepare("UPDATE campaigns SET state='validating',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(p.campaignId);
-  } else if (second.some(c => !['completed','failed','busy','no_answer','cancelled','dispatch_unknown'].includes(c.state))) return;
-  const all = callsFor(p.campaignId);
+  }
+  const all = allCalls;
   const offers = all.filter(c => c.quote_json).map(c => {
     const quote = JSON.parse(c.quote_json);
     return { seller: c.business_name, phone: c.phone_e164, url: c.product_url, round: c.round, quote,
@@ -458,7 +574,7 @@ async function advanceCampaign(p: any) {
       ? `No seller-confirmed grand total is available. ${result.best_estimate.seller} quoted ₹${formatInr(result.best_estimate.quote.unit_price)} per unit for ${result.best_estimate.quote.quantity}; calculated subtotal ₹${formatInr(result.best_estimate.calculated_subtotal!)} (quantity × unit price), not confirmed by the seller as a grand total.`
       : offers.length ? 'Partial quote details were collected; there is not enough confirmed pricing to calculate a comparable total.'
         : 'Calls are complete, but no price details could be extracted from the transcripts.';
-  const body = `Negotiations are complete.\n\n${summary}${offers.map(o => `\n\n${o.seller}: ${o.quote.total != null ? `seller-confirmed total ₹${formatInr(o.quote.total)}` : o.quote.unit_price != null ? `₹${formatInr(o.quote.unit_price)} per unit${o.calculated_subtotal !== null ? `; calculated subtotal ₹${formatInr(o.calculated_subtotal)} (not seller-confirmed)` : ''}` : 'partial quote'}${o.quote.gst?.included ? '; GST included' : ''}${o.quote.shipping?.included ? '; shipping included' : ''}${o.quote.delivery ? `; delivery ${o.quote.delivery}` : ''}${o.quote.validity ? `; valid ${o.quote.validity}` : ''}`).join('')}\n\nSend “recording” to hear the latest saved call. The buyer decides whether to proceed.`;
+  const body = `Negotiations are complete.\n\n${summary}${offers.map(o => `\n\n${o.seller}: ${o.quote.total != null ? `seller-confirmed total ₹${formatInr(o.quote.total)}` : o.quote.unit_price != null ? `₹${formatInr(o.quote.unit_price)} per unit${o.calculated_subtotal !== null ? `; calculated subtotal ₹${formatInr(o.calculated_subtotal)} (not seller-confirmed)` : ''}` : 'partial quote'}${o.quote.gst?.included ? '; GST included' : ''}${o.quote.shipping?.included ? '; shipping included' : ''}${o.quote.delivery ? `; delivery ${o.quote.delivery}` : ''}${o.quote.validity ? `; valid ${o.quote.validity}` : ''}`).join('')}\n\nSend “recording” to review call notes. The buyer decides whether to proceed.`;
   await notifyCampaign(p.campaignId, body);
 }
 
@@ -480,8 +596,13 @@ export async function handleTool(name: string, body: any) {
     FROM calls JOIN sellers ON sellers.id=calls.seller_id JOIN campaigns ON campaigns.id=calls.campaign_id WHERE calls.id=?`).get(callId) as any;
   if (!call) throw new Error('Unknown call context');
   if (name === 'get_negotiation_brief') return { seller: call.business_name, product: call.brief_json ?? call.request_text, round: call.round, quote_context: call.quote_json, stop: call.campaign_state === 'paused' };
-  if (name === 'capture_quote') { db.prepare('UPDATE calls SET quote_json=? WHERE id=?').run(JSON.stringify(body.quote ?? body), call.id); return { saved: true }; }
-  if (name === 'next_negotiation_move') return { instruction: call.round === 2 ? 'Ask whether they can meet or improve on the buyer-provided verified benchmark; do not state the competitor identity unless the buyer context explicitly permits it.' : 'Ask for their best total price including GST and shipping, and confirm delivery and validity.' };
+  if (name === 'capture_quote') {
+    const quote = body.quote ?? body;
+    db.prepare('UPDATE calls SET quote_json=? WHERE id=?').run(JSON.stringify(quote), call.id);
+    recordSellerQuote(call.id, quote);
+    return { saved: true };
+  }
+  if (name === 'next_negotiation_move') return { instruction: call.round > 1 ? 'Ask whether they can meet or improve on the buyer-provided verified benchmark; do not state the competitor identity unless the buyer context explicitly permits it.' : 'Ask for their best total price including GST and shipping, and confirm delivery and validity.' };
   if (name === 'record_followup') {
     const prior = call.quote_json ? JSON.parse(call.quote_json) : {};
     prior.callback_permission = body.callback_permission === true;
@@ -492,7 +613,7 @@ export async function handleTool(name: string, body: any) {
 }
 
 const runners: Record<string, (payload: any) => Promise<void>> = {
-  research: doResearch, dispatch_call: dispatchCall, reconcile_call: doReconcile,
+  research: doResearch, dispatch_call: dispatchCall, reconcile_call: doReconcile, retry_busy_call: retryBusyCall,
   advance_campaign: advanceCampaign, send_recording: doSendRecording,
   process_message: async p => processBuyerMessage(p.buyer, p.text, p.messageId, p.sellerContacts ?? [], p.threadId),
 };

@@ -1,4 +1,4 @@
-# Sauda engineering plan: one server, SQLite, OpenAI, and Bolna
+# ezbz.ai engineering plan: one server, SQLite, OpenAI, and Bolna
 
 > **Current direction:** The buyer interface is now a protected browser console; WhatsApp has been dropped. The original plan below is superseded where it describes the buyer channel. See [README.md](README.md) for the implemented flow.
 
@@ -96,7 +96,7 @@ The coordinator is deterministic code. Do not give an LLM direct SQL, arbitrary 
       transitions.test.ts
       provider-events.test.ts
     data/                       Mounted persistent volume; ignored by Git
-      sauda.sqlite
+      ezbz.ai.sqlite
       recordings/<call-id>/
       research/<campaign-id>/
       transcripts/<call-id>.txt
@@ -209,7 +209,7 @@ Model-generated phone digits must be backed by an attributable retrieved excerpt
 
 Show source/product links beside each seller in WhatsApp. Preserve OpenAI search citations as visible usable URLs rather than losing them during normalization.
 
-Do not use Playwright, login automation or CAPTCHA workarounds initially. If a page is blocked, research other public sources. If the exact product cannot be identified, ask one focused question. The success criterion is working research, not a simulated result dressed as search.
+Do not use Playwright, login automation or CAPTCHA workarounds initially. If a page is blocked, research other public sources. If the exact product cannot be identified, ask one focused question. The success criterion is source-backed product research; do not present unverified results as sourced.
 
 ## 9. Bolna setup and integration
 
