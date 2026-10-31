@@ -1,4 +1,6 @@
-# Sauda: WhatsApp-only real-demo runbook
+# Sauda: browser-console real-demo runbook
+
+> **Current direction:** The buyer uses the protected browser console; WhatsApp has been dropped. See [README.md](README.md) for the current E2E flow. Original WhatsApp-specific steps below are superseded.
 
 Revised planning artifact. No bot has been deployed and no calls or messages have been sent.
 

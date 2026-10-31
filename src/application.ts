@@ -6,84 +6,163 @@ import { pipeline } from 'node:stream/promises';
 import { Readable } from 'node:stream';
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import { config } from './config.js';
-import { db, enqueue, getConversation, logMessage, newId } from './db.js';
-import { researchProduct, extractQuote } from './providers/openai.js';
-import { sendText, sendAudio } from './providers/whatsapp.js';
+import { db, enqueue, getChat, getChatOwner, logMessage, newId } from './db.js';
+import { researchProduct, extractQuote, understandBuyerMessage, type BuyerIntake } from './providers/openai.js';
 import { getExecution, startCall } from './providers/bolna.js';
 
 type Job = { id: number; unique_key: string; kind: string; payload: string; attempts: number };
-const say = async (conversationId: string, to: string, text: string) => {
-  const messageId = await sendText(to, text);
-  logMessage(conversationId, 'out', text, messageId);
+export type BuyerSellerContact = { business_name: string; phone_e164: string; product_url: string | null };
+
+export function parseBuyerSellerContacts(input: string): { sellers?: BuyerSellerContact[]; error?: string } {
+  const lines = input.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+  if (lines.length > config.maxSellers) return { error: `Enter at most ${config.maxSellers} seller numbers.` };
+  const sellers: BuyerSellerContact[] = [];
+  const seen = new Set<string>();
+  for (const [index, line] of lines.entries()) {
+    const parts = line.split('|').map(part => part.trim());
+    const phoneText = parts.length === 1 ? parts[0] : parts[1];
+    const phone = parsePhoneNumberFromString(phoneText ?? '', 'IN');
+    if (!phone?.isValid() || phone.country !== 'IN') return { error: `Seller line ${index + 1} must contain a valid Indian phone number.` };
+    if (seen.has(phone.number)) return { error: `Seller line ${index + 1} repeats a phone number.` };
+    seen.add(phone.number);
+    const urlText = parts.length > 2 ? parts.slice(2).join('|').trim() : '';
+    let productUrl: string | null = null;
+    if (urlText) {
+      try { const parsed = new URL(urlText); if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error(); productUrl = parsed.href; }
+      catch { return { error: `Seller line ${index + 1} has an invalid listing URL.` }; }
+    }
+    sellers.push({ business_name: parts.length === 1 ? `Buyer-supplied seller ${index + 1}` : (parts[0] || `Buyer-supplied seller ${index + 1}`), phone_e164: phone.number, product_url: productUrl });
+  }
+  return { sellers };
+}
+
+function fallbackBuyerIntake(message: string): BuyerIntake {
+  const phonePattern = /(?:\+?91[\s.-]*)?([6-9](?:[\s.-]*\d){9})/g;
+  const matches = [...message.matchAll(phonePattern)];
+  const sellers = matches.slice(0, config.maxSellers).flatMap((match, index) => {
+    const rawPhone = match[0];
+    const start = match.index ?? 0;
+    const before = message.slice(Math.max(0, start - 100), start);
+    const nameMatch = before.match(/(?:call|contact|reach|and)\s+([A-Za-z][\w&.' -]{0,55}?)\s+(?:at|on|number|phone)\s*$/i);
+    const nextStart = matches[index + 1]?.index ?? message.length;
+    const sellerSegment = message.slice(start + rawPhone.length, nextStart);
+    const url = sellerSegment.match(/https?:\/\/[^\s),]+/i)?.[0] ?? null;
+    return [{ business_name: nameMatch?.[1]?.trim() || `Buyer-supplied seller ${index + 1}`, phone: rawPhone, product_url: url }];
+  });
+  const firstPhoneStart = matches[0]?.index;
+  const productSource = firstPhoneStart === undefined ? message : message.slice(0, firstPhoneStart);
+  const productRequest = productSource.replace(/^new:\s*/i, '').replace(/(?:,?\s*(?:and\s+)?(?:call|contact|reach)\s+[^,.;\n]*)$/i, '')
+    .replace(/\s+/g, ' ').replace(/[\s,;.-]+$/, '').trim();
+  const productLike = /\b(buy|buying|need|want|source|supplier|seller|product|quote|cotton|shirt|t-?shirt|order|quantity|gsm|delivery|deliver|negotiate)\b|https?:\/\//i.test(productRequest);
+  if (sellers.length && !productRequest) return { kind: 'needs_product_details', product_request: null, sellers, response: 'I have the seller contacts. What product and quantity should I discuss with them?' };
+  if (productLike) return { kind: 'purchase_request', product_request: productRequest, sellers, response: null };
+  return { kind: 'general_chat', product_request: null, sellers: [], response: 'OpenAI is temporarily rate-limited, so I cannot answer that right now. You can still send a product brief and seller phone numbers for me to prepare a call list.' };
+}
+const say = async (conversationId: string, to: string, text: string, threadId?: string) => {
+  void to;
+  logMessage(conversationId, 'out', text, `ui-${newId()}`, threadId);
 };
 const campaignFor = (id: string) => db.prepare('SELECT * FROM campaigns WHERE id=?').get(id) as any;
 const sellersFor = (id: string) => db.prepare('SELECT * FROM sellers WHERE campaign_id=? AND excluded=0 ORDER BY position').all(id) as any[];
 const callsFor = (id: string, round?: number) => db.prepare(`SELECT calls.*, sellers.business_name, sellers.phone_e164, sellers.product_url
  FROM calls JOIN sellers ON sellers.id=calls.seller_id WHERE calls.campaign_id=? ${round ? 'AND calls.round=?' : ''} ORDER BY calls.rowid`)
   .all(...(round ? [id, round] : [id])) as any[];
+const numericAmount = (value: unknown) => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') return null;
+  const parsed = Number(value.replace(/,/g, '').match(/[\d.]+/)?.[0]);
+  return Number.isFinite(parsed) ? parsed : null;
+};
+const calculatedSubtotal = (quote: any) => {
+  const quantity = numericAmount(quote.quantity);
+  const unitPrice = numericAmount(quote.unit_price);
+  return quantity !== null && unitPrice !== null ? quantity * unitPrice : null;
+};
+const formatInr = (amount: number) => new Intl.NumberFormat('en-IN', { maximumFractionDigits: 2 }).format(amount);
 
-export async function processBuyerMessage(buyer: string, text: string, messageId: string) {
-  const conversation = getConversation(buyer);
+export async function processBuyerMessage(buyer: string, text: string, messageId: string, sellerContacts: BuyerSellerContact[] = [], requestedThreadId?: string) {
+  const owner = getChatOwner(buyer);
+  const conversation = owner.conversation;
+  const thread = requestedThreadId ? getChat(buyer, requestedThreadId) : owner.thread;
+  if (!thread) return;
   const lower = text.trim().toLowerCase();
-  logMessage(conversation.id, 'in', text, messageId);
+  logMessage(conversation.id, 'in', text, messageId, thread.id);
   db.prepare('UPDATE conversations SET last_inbound_at=CURRENT_TIMESTAMP WHERE id=?').run(conversation.id);
-  const campaignId = conversation.active_campaign_id;
+  db.prepare('UPDATE chat_threads SET updated_at=CURRENT_TIMESTAMP WHERE id=?').run(thread.id);
+  const campaignId = thread.active_campaign_id;
   if (/^(stop|pause|cancel)\b/.test(lower)) {
     if (campaignId) {
       db.prepare("UPDATE campaigns SET state='paused',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(campaignId);
       db.prepare("UPDATE jobs SET state='cancelled' WHERE state='queued' AND payload LIKE ?").run(`%${campaignId}%`);
-      await say(conversation.id, buyer, 'Paused. I will not start more calls. A seller already on a live call may still finish; send “resume” if you want to continue.');
-    } else await say(conversation.id, buyer, 'There is no active request to pause.');
+      await say(conversation.id, buyer, 'Paused. I will not start more calls. A seller already on a live call may still finish; send “resume” if you want to continue.', thread.id);
+    } else await say(conversation.id, buyer, 'There is no active request to pause.', thread.id);
     return;
   }
   if (/^resume\b/.test(lower) && campaignId) {
-    db.prepare("UPDATE campaigns SET state='collecting',updated_at=CURRENT_TIMESTAMP WHERE id=? AND state='paused'").run(campaignId);
-    enqueue(`advance:${campaignId}:resume`, 'advance_campaign', { campaignId });
-    await say(conversation.id, buyer, 'Resumed. I will continue the remaining authorized work.'); return;
+    const campaign = campaignFor(campaignId);
+    if (campaign?.state === 'paused') {
+      const existingCalls = callsFor(campaignId);
+      const existingSellers = sellersFor(campaignId);
+      if (!existingCalls.length && existingSellers.length) {
+        db.prepare("UPDATE campaigns SET state='shortlist_ready',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(campaignId);
+      } else if (!existingCalls.length) {
+        db.prepare("UPDATE campaigns SET state='researching',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(campaignId);
+        enqueue(`research:${campaignId}:resume:${Date.now()}`, 'research', { campaignId, buyer, conversationId: conversation.id, threadId: thread.id, request: campaign.request_text });
+      } else {
+        db.prepare("UPDATE campaigns SET state='collecting',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(campaignId);
+        for (const call of existingCalls.filter(c => c.state === 'queued')) {
+          const key = `dispatch:${call.id}`;
+          enqueue(key, 'dispatch_call', { callId: call.id });
+          db.prepare("UPDATE jobs SET state='queued',due_at=CURRENT_TIMESTAMP,last_error=NULL WHERE unique_key=? AND state IN ('done','cancelled','failed')").run(key);
+        }
+        enqueue(`advance:${campaignId}:resume:${Date.now()}`, 'advance_campaign', { campaignId });
+      }
+    }
+    await say(conversation.id, buyer, 'Resumed. I will continue the remaining authorized work.', thread.id); return;
   }
   if (/^(status|progress)\b/.test(lower) && campaignId) {
     const campaign = campaignFor(campaignId); const calls = callsFor(campaignId);
-    await say(conversation.id, buyer, `Request status: ${campaign.state}. Calls: ${calls.filter(c => c.state === 'completed').length} complete, ${calls.filter(c => ['queued','calling','in_progress'].includes(c.state)).length} in progress, ${calls.filter(c => ['failed','dispatch_unknown'].includes(c.state)).length} failed or needing dispatch review.`); return;
+    await say(conversation.id, buyer, `Request status: ${campaign.state}. Calls: ${calls.filter(c => c.state === 'completed').length} complete, ${calls.filter(c => ['queued','calling','in_progress'].includes(c.state)).length} in progress, ${calls.filter(c => ['failed','dispatch_unknown'].includes(c.state)).length} failed or needing dispatch review.`, thread.id); return;
   }
   if (/^(compare|offers|quotes)\b/.test(lower) && campaignId) {
     const result = campaignFor(campaignId)?.result_json;
-    if (!result) { await say(conversation.id, buyer, 'There are no completed comparable offers yet. Send “status” for progress.'); return; }
+    if (!result) { await say(conversation.id, buyer, 'There are no completed comparable offers yet. Send “status” for progress.', thread.id); return; }
     const offers = JSON.parse(result).offers as any[];
-    await say(conversation.id, buyer, offers.length ? offers.map((o, i) => `${i + 1}. ${o.seller}: ₹${o.quote.total} (round ${o.round})${o.quote.gst != null ? `; GST ${o.quote.gst}` : ''}${o.quote.shipping != null ? `; shipping ${o.quote.shipping}` : ''}`).join('\n') : 'No complete confirmed totals are available.'); return;
+    await say(conversation.id, buyer, offers.length ? offers.map((o, i) => `${i + 1}. ${o.seller}: ${o.quote.total != null ? `seller-confirmed total ₹${formatInr(o.quote.total)}` : o.calculated_subtotal != null ? `₹${formatInr(o.quote.unit_price)} per unit; calculated subtotal ₹${formatInr(o.calculated_subtotal)} (${o.quote.quantity} × ₹${formatInr(o.quote.unit_price)}), not a seller-confirmed grand total` : 'partial quote; no comparable total'} (round ${o.round})`).join('\n') : 'No price details were extracted from the calls yet. Open a call card to review its transcript.', thread.id); return;
   }
   if (/^(transcript|transcripts)\b/.test(lower) && campaignId) {
     const calls = callsFor(campaignId).filter(c => c.transcript);
-    if (!calls.length) { await say(conversation.id, buyer, 'No call transcript is available yet.'); return; }
+    if (!calls.length) { await say(conversation.id, buyer, 'No call transcript is available yet.', thread.id); return; }
     const selected = calls.find(c => lower.includes(c.business_name.toLowerCase())) ?? calls[calls.length - 1];
-    await say(conversation.id, buyer, `Transcript — ${selected.business_name}:\n${String(selected.transcript).slice(0, 3500)}`); return;
+    await say(conversation.id, buyer, `Transcript — ${selected.business_name}:\n${String(selected.transcript).slice(0, 3500)}`, thread.id); return;
   }
   if (/^exclude seller\b/.test(lower) && campaignId) {
     const name = text.replace(/^exclude seller\s*/i, '').trim().toLowerCase();
     const seller = sellersFor(campaignId).find(s => s.business_name.toLowerCase().includes(name));
-    if (!seller) { await say(conversation.id, buyer, 'I could not match that seller. Reply “exclude seller” followed by the business name shown in the shortlist.'); return; }
-    if (campaignFor(campaignId).state !== 'shortlist_ready') { await say(conversation.id, buyer, 'Seller exclusion is available before calls start. Send “stop” to pause an active campaign.'); return; }
+    if (!seller) { await say(conversation.id, buyer, 'I could not match that seller. Reply “exclude seller” followed by the business name shown in the shortlist.', thread.id); return; }
+    if (campaignFor(campaignId).state !== 'shortlist_ready') { await say(conversation.id, buyer, 'Seller exclusion is available before calls start. Send “stop” to pause an active campaign.', thread.id); return; }
     db.prepare('UPDATE sellers SET excluded=1 WHERE id=?').run(seller.id);
-    await say(conversation.id, buyer, `Excluded ${seller.business_name}. The remaining displayed sellers are unchanged; reply “Call them all” when ready.`); return;
+    await say(conversation.id, buyer, `Excluded ${seller.business_name}. The remaining displayed sellers are unchanged; reply “Call them all” when ready.`, thread.id); return;
   }
   const correction = text.match(/^correct\s+(.+?)\s+(?:to\s+)?(?:₹|rs\.?\s*)\s*([\d,]+(?:\.\d{1,2})?)\s*$/i);
   if (correction && campaignId) {
     const sellerName = correction[1].trim().toLowerCase(); const amount = Number(correction[2].replace(/,/g, ''));
     const call = callsFor(campaignId).find(c => c.business_name.toLowerCase().includes(sellerName) && c.quote_json);
-    if (!call || !Number.isFinite(amount)) { await say(conversation.id, buyer, 'I could not find an extracted quote for that seller. Use: “correct [seller name] to ₹[total]”.'); return; }
+    if (!call || !Number.isFinite(amount)) { await say(conversation.id, buyer, 'I could not find an extracted quote for that seller. Use: “correct [seller name] to ₹[total]”.', thread.id); return; }
     const quote = JSON.parse(call.quote_json); quote.total = amount; quote.corrected_by_buyer = true;
     db.prepare('UPDATE calls SET quote_json=? WHERE id=?').run(JSON.stringify(quote), call.id);
     const offers = callsFor(campaignId).filter(c => c.quote_json).map(c => ({ seller: c.business_name, total: JSON.parse(c.quote_json).total })).filter(o => typeof o.total === 'number').sort((a,b) => a.total - b.total);
     const result = { offers: offers.map(o => ({ ...o, quote: { total: o.total } })), best: offers[0] ?? null };
     db.prepare('UPDATE campaigns SET result_json=? WHERE id=?').run(JSON.stringify(result), campaignId);
-    await say(conversation.id, buyer, `Updated ${call.business_name}'s total to ₹${amount}. The comparison has been recalculated.`); return;
+    await say(conversation.id, buyer, `Updated ${call.business_name}'s total to ₹${amount}. The comparison has been recalculated.`, thread.id); return;
   }
   if (/\b(call them all|call all|start calls|go ahead|yes,? call)\b/.test(lower)) {
-    if (!campaignId) { await say(conversation.id, buyer, 'Send a product link or description first, and I will research sellers.'); return; }
+    if (!campaignId) { await say(conversation.id, buyer, 'Send a product link or description first, and I will research sellers.', thread.id); return; }
     const campaign = campaignFor(campaignId);
-    if (campaign.state === 'collecting') { await say(conversation.id, buyer, 'Calls were already authorized for this shortlist. Send “status” to check progress.'); return; }
-    if (campaign.state !== 'shortlist_ready') { await say(conversation.id, buyer, `This request is ${campaign.state}. Send a new product link for another request.`); return; }
-    const sellers = sellersFor(campaignId).filter(s => s.phone_e164 && s.match_state === 'verified');
-    if (!sellers.length) { await say(conversation.id, buyer, 'I could not verify a callable seller phone number from the research. I will not dial an unverified number.'); return; }
+    if (campaign.state === 'collecting') { await say(conversation.id, buyer, 'Calls were already authorized for this shortlist. Send “status” to check progress.', thread.id); return; }
+    if (campaign.state !== 'shortlist_ready') { await say(conversation.id, buyer, `This request is ${campaign.state}. Send a new product link for another request.`, thread.id); return; }
+    const sellers = sellersFor(campaignId).filter(s => s.phone_e164 && ['verified', 'buyer_provided'].includes(s.match_state));
+    if (!sellers.length) { await say(conversation.id, buyer, 'I could not verify a callable seller phone number from the research. I will not dial an unverified number.', thread.id); return; }
     const authKey = `authorize:${campaignId}`;
     const tx = db.transaction(() => {
       db.prepare("UPDATE campaigns SET state='collecting',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(campaignId);
@@ -96,27 +175,115 @@ export async function processBuyerMessage(buyer: string, text: string, messageId
         .run('buyer', authKey, campaignId, 'calls_authorized', JSON.stringify({ messageId, sellerIds: sellers.map(s => s.id) }));
     });
     tx();
-    await say(conversation.id, buyer, `Authorized. I am calling ${sellers.length} researched sellers now. You can send “status”, “stop”, or “recording”.`); return;
+    await say(conversation.id, buyer, `Authorized. I am calling ${sellers.length} seller(s) from your shortlist now. You can send “status”, “stop”, or “recording”.`, thread.id); return;
   }
   if (/\b(recording|play audio|play call)\b/.test(lower) && campaignId) {
     const call = db.prepare("SELECT * FROM calls WHERE campaign_id=? AND recording_path IS NOT NULL ORDER BY completed_at DESC LIMIT 1").get(campaignId) as any;
-    if (!call) { await say(conversation.id, buyer, 'No completed recording is available yet. Ask again after the call finishes.'); return; }
-    enqueue(`audio:${call.id}`, 'send_recording', { callId: call.id, buyer, conversationId: conversation.id });
-    await say(conversation.id, buyer, 'Sending the latest saved call recording.'); return;
+    if (!call) { await say(conversation.id, buyer, 'No completed recording is available yet. Use the Calls panel to play recordings when they finish.', thread.id); return; }
+    await say(conversation.id, buyer, `A saved recording is available for call ${call.id}. Use its Play button in the Calls panel.`, thread.id); return;
   }
-  if (campaignId && ['shortlist_ready','collecting','validating','renegotiating','result_ready'].includes(campaignFor(campaignId)?.state)) {
-    await say(conversation.id, buyer, 'I have this request in progress. Send “status”, “call them all” (to authorize calls), “recording”, or “stop”. For a different product, send “new:” followed by its link or description.');
-    if (!lower.startsWith('new:')) return;
-    text = text.replace(/^new:\s*/i, '');
+  const explicitNew = /^new:\s*/i.test(text.trim());
+  const intakeText = text.replace(/^new:\s*/i, '').trim();
+  const recent = db.prepare('SELECT direction,content FROM messages WHERE thread_id=? ORDER BY id DESC LIMIT 14').all(thread.id) as any[];
+  const history = recent.reverse().map(m => `${m.direction === 'in' ? 'buyer' : 'Sauda'}: ${m.content}`).join('\n');
+  let intake: BuyerIntake;
+  let usedFallback = false;
+  try { intake = await understandBuyerMessage(intakeText, explicitNew ? '' : history); }
+  catch (error) {
+    if (/429|rate limit/i.test(String(error))) {
+      intake = fallbackBuyerIntake(intakeText);
+      usedFallback = true;
+    } else {
+      await say(conversation.id, buyer, `I couldn't organize that message just now. Please try again, or send a product description and any seller phone numbers in the same message. (${String(error).slice(0, 180)})`, thread.id);
+      return;
+    }
   }
-  createCampaign(conversation.id, buyer, text);
+  if (intake.kind === 'general_chat') {
+    await say(conversation.id, buyer, intake.response || 'Sure—what would you like help with?', thread.id);
+    return;
+  }
+  if (intake.kind === 'needs_product_details' || !intake.product_request?.trim()) {
+    await say(conversation.id, buyer, intake.response || 'What product and quantity would you like me to source or negotiate?', thread.id);
+    return;
+  }
+
+  const sourceDigits = `${intakeText}\n${history}`.replace(/\D/g, '');
+  const modelContactLines = intake.sellers.map(s => `${s.business_name ?? ''} | ${s.phone} | ${s.product_url ?? ''}`).join('\n');
+  const parsedModelContacts = parseBuyerSellerContacts(modelContactLines);
+  if (parsedModelContacts.error) {
+    await say(conversation.id, buyer, `${parsedModelContacts.error} Please resend the seller numbers in a clearer format.`, thread.id);
+    return;
+  }
+  const contactsFromText = (parsedModelContacts.sellers ?? []).filter(s => sourceDigits.includes(s.phone_e164.slice(-10)));
+  const contacts = [...sellerContacts, ...contactsFromText].filter((seller, index, all) => all.findIndex(item => item.phone_e164 === seller.phone_e164) === index);
+  if (contacts.length > config.maxSellers) {
+    await say(conversation.id, buyer, `I can prepare up to ${config.maxSellers} calls per request. Please narrow the seller list and send it again.`, thread.id);
+    return;
+  }
+  if (usedFallback && !contacts.length) {
+    await say(conversation.id, buyer, 'OpenAI has reached its daily request limit, so web research is temporarily unavailable. Send the product brief with seller phone numbers to prepare a buyer-supplied shortlist, or try research again after the limit resets.', thread.id);
+    return;
+  }
+
+  const currentCampaign = campaignId ? campaignFor(campaignId) : null;
+  if (currentCampaign?.state === 'shortlist_ready' && !explicitNew) {
+    const existing = sellersFor(campaignId!);
+    const existingPhones = new Set(existing.map(s => s.phone_e164).filter(Boolean));
+    const newContacts = contacts.filter(s => !existingPhones.has(s.phone_e164));
+    if (existing.length + newContacts.length > config.maxSellers) {
+      await say(conversation.id, buyer, `This shortlist can contain up to ${config.maxSellers} sellers. Remove a seller or start a new request with “new:”.`, thread.id);
+      return;
+    }
+    const brief = currentCampaign.brief_json ? JSON.parse(currentCampaign.brief_json) : { product_attributes: [], missing_questions: [] };
+    brief.product_summary = intake.product_request;
+    const add = db.transaction(() => {
+      db.prepare('UPDATE campaigns SET request_text=?,brief_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?')
+        .run(intake.product_request, JSON.stringify(brief), campaignId);
+      const insert = db.prepare(`INSERT INTO sellers(id,campaign_id,position,business_name,phone_e164,product_url,source_url,evidence,match_state)
+        VALUES(?,?,?,?,?,?,NULL,?,'buyer_provided')`);
+      newContacts.forEach((seller, i) => insert.run(newId(), campaignId, existing.length + i + 1, seller.business_name,
+        seller.phone_e164, seller.product_url, 'Phone number supplied by buyer; Sauda has not independently verified that it belongs to this seller.'));
+    });
+    add();
+    await say(conversation.id, buyer, `Updated the product brief and added ${newContacts.length} buyer-supplied seller contact(s). Review the shortlist, then choose “Call all sellers” when ready.`, thread.id);
+    return;
+  }
+  if (currentCampaign && ['researching','collecting','validating','renegotiating'].includes(currentCampaign.state) && !explicitNew) {
+    if (contacts.length && currentCampaign.state === 'researching') {
+      const existing = sellersFor(campaignId!); const existingPhones = new Set(existing.map(s => s.phone_e164).filter(Boolean));
+      const newContacts = contacts.filter(s => !existingPhones.has(s.phone_e164));
+      if (existing.length + newContacts.length <= config.maxSellers) {
+        const insert = db.prepare(`INSERT INTO sellers(id,campaign_id,position,business_name,phone_e164,product_url,source_url,evidence,match_state)
+          VALUES(?,?,?,?,?,?,NULL,?,'buyer_provided')`);
+        newContacts.forEach((seller, i) => insert.run(newId(), campaignId, existing.length + i + 1, seller.business_name,
+          seller.phone_e164, seller.product_url, 'Phone number supplied by buyer; Sauda has not independently verified that it belongs to this seller.'));
+        await say(conversation.id, buyer, `Added ${newContacts.length} buyer-supplied seller contact(s) to the shortlist being researched. I will not call until you authorize the completed shortlist.`, thread.id);
+        return;
+      }
+    }
+    await say(conversation.id, buyer, `This request is ${currentCampaign.state}. I won't change the details during active research or calls. Send “new:” to start another request, or “stop” to pause calls.`, thread.id);
+    return;
+  }
+
+  createCampaign(conversation.id, thread.id, buyer, intake.product_request, contacts);
+  if (contacts.length) await say(conversation.id, buyer, `Prepared the product brief and ${contacts.length} buyer-supplied seller contact(s). These numbers are clearly labeled as buyer-supplied. ${usedFallback ? 'OpenAI is rate-limited, so I used the supplied text and validated the numbers directly. ' : ''}Review the shortlist, then choose “Call all sellers” when ready.`, thread.id);
 }
 
-function createCampaign(conversationId: string, buyer: string, request: string) {
+function createCampaign(conversationId: string, threadId: string, buyer: string, request: string, sellerContacts: BuyerSellerContact[] = []) {
   const campaignId = newId();
-  db.prepare("INSERT INTO campaigns(id,conversation_id,state,request_text) VALUES(?,?,'researching',?)").run(campaignId, conversationId, request);
-  db.prepare('UPDATE conversations SET active_campaign_id=? WHERE id=?').run(campaignId, conversationId);
-  enqueue(`research:${campaignId}`, 'research', { campaignId, buyer, conversationId, request });
+  const manualBrief = sellerContacts.length ? JSON.stringify({ product_summary: request, product_attributes: [], missing_questions: [] }) : null;
+  db.prepare('INSERT INTO campaigns(id,conversation_id,thread_id,state,request_text,brief_json) VALUES(?,?,?,?,?,?)')
+    .run(campaignId, conversationId, threadId, sellerContacts.length ? 'shortlist_ready' : 'researching', request, manualBrief);
+  db.prepare('UPDATE chat_threads SET active_campaign_id=?,title=?,updated_at=CURRENT_TIMESTAMP WHERE id=?')
+    .run(campaignId, request.slice(0, 70), threadId);
+  if (sellerContacts.length) {
+    const insert = db.prepare(`INSERT INTO sellers(id,campaign_id,position,business_name,phone_e164,product_url,source_url,evidence,match_state)
+      VALUES(?,?,?,?,?,?,?,?, 'buyer_provided')`);
+    const add = db.transaction(() => sellerContacts.forEach((seller, i) => insert.run(newId(), campaignId, i + 1, seller.business_name,
+      seller.phone_e164, seller.product_url, null, 'Phone number supplied by buyer; Sauda has not independently verified that it belongs to this seller.')));
+    add();
+  } else enqueue(`research:${campaignId}`, 'research', { campaignId, buyer, conversationId, threadId, request });
+  return campaignId;
 }
 
 async function doResearch(p: any) {
@@ -144,7 +311,7 @@ async function doResearch(p: any) {
   const sellers = sellersFor(p.campaignId);
   const list = sellers.map((s, i) => `${i + 1}. ${s.business_name}${s.match_state === 'verified' ? ` — ${s.phone_e164}` : ' — phone not verified; will not call'}\n   Product: ${s.product_url ?? 'not provided'}\n   Source: ${s.source_url}\n   Evidence: ${s.evidence}`).join('\n\n');
   const questions = result.missing_questions.length ? `\n\nNeed to know: ${result.missing_questions.join('; ')}` : '';
-  await say(p.conversationId, p.buyer, `I researched your request.\n\nProduct: ${result.product_summary}\nDetails: ${result.product_attributes.join(', ') || 'not confirmed'}\n\nSellers:\n${list || 'No sellers with usable source evidence were found.'}${questions}\n\nReply “Call them all” to authorize calls to the sellers with verified phone numbers.`);
+  await say(p.conversationId, p.buyer, `I researched your request.\n\nProduct: ${result.product_summary}\nDetails: ${result.product_attributes.join(', ') || 'not confirmed'}\n\nSellers:\n${list || 'No sellers with usable source evidence were found.'}${questions}\n\nReply “Call them all” to authorize calls to the sellers with verified phone numbers.`, p.threadId);
 }
 
 async function dispatchCall(p: any) {
@@ -181,7 +348,7 @@ function logEvent(source: string, key: string, campaignId: string | null, callId
 }
 
 export async function processBolnaWebhook(body: any) {
-  const executionId = String(body.execution_id ?? body.data?.execution_id ?? body.call_id ?? '');
+  const executionId = String(body.execution_id ?? body.data?.execution_id ?? body.call_id ?? body.id ?? body.data?.id ?? '');
   if (!executionId) { logEvent('bolna', null as any, null, null, 'unmatched_webhook', body); return; }
   let call = db.prepare('SELECT * FROM calls WHERE bolna_execution_id=?').get(executionId) as any;
   if (!call) {
@@ -204,7 +371,8 @@ export async function processBolnaWebhook(body: any) {
       .run(state, terminal.includes(state) ? 1 : 0, call.id);
   }
   const transcript = body.transcript ?? body.data?.transcript ?? body.execution?.transcript ?? body.data?.execution?.transcript;
-  const recordingUrl = body.recording_url ?? body.data?.recording_url ?? body.execution?.recording_url ?? body.data?.execution?.recording_url;
+  const recordingUrl = body.recording_url ?? body.data?.recording_url ?? body.telephony_data?.recording_url
+    ?? body.data?.telephony_data?.recording_url ?? body.execution?.recording_url ?? body.data?.execution?.recording_url;
   if (transcript || recordingUrl) db.prepare('UPDATE calls SET transcript=COALESCE(?,transcript),recording_url=COALESCE(?,recording_url) WHERE id=?')
     .run(transcript ? String(transcript) : null, recordingUrl ? String(recordingUrl) : null, call.id);
   if (state === 'completed' || eventName.includes('disconnect')) enqueue(`reconcile:${call.id}`, 'reconcile_call', { callId: call.id });
@@ -220,7 +388,7 @@ async function doReconcile(p: any) {
   }
   const data = payload.execution ?? payload.data ?? payload;
   const transcript = call.transcript ?? data.transcript ?? data.transcription ?? '';
-  const recordingUrl = call.recording_url ?? data.recording_url ?? data.recording ?? data.audio_url;
+  const recordingUrl = call.recording_url ?? data.recording_url ?? data.recording ?? data.audio_url ?? data.telephony_data?.recording_url;
   db.prepare('UPDATE calls SET transcript=?,recording_url=? WHERE id=?').run(String(transcript), recordingUrl ? String(recordingUrl) : null, call.id);
   const campaign = campaignFor(call.campaign_id);
   if (transcript) {
@@ -274,25 +442,36 @@ async function advanceCampaign(p: any) {
     db.prepare("UPDATE campaigns SET state='validating',updated_at=CURRENT_TIMESTAMP WHERE id=?").run(p.campaignId);
   } else if (second.some(c => !['completed','failed','busy','no_answer','cancelled','dispatch_unknown'].includes(c.state))) return;
   const all = callsFor(p.campaignId);
-  const offers = all.filter(c => c.quote_json).map(c => ({ seller: c.business_name, phone: c.phone_e164, url: c.product_url, round: c.round, quote: JSON.parse(c.quote_json) }))
-    .filter(x => typeof x.quote.total === 'number').sort((a, b) => a.quote.total - b.quote.total);
-  const result = { offers, best: offers[0] ?? null };
+  const offers = all.filter(c => c.quote_json).map(c => {
+    const quote = JSON.parse(c.quote_json);
+    return { seller: c.business_name, phone: c.phone_e164, url: c.product_url, round: c.round, quote,
+      calculated_subtotal: typeof quote.total === 'number' ? null : calculatedSubtotal(quote) };
+  }).filter(x => !x.quote.extraction_error && (typeof x.quote.total === 'number' || x.calculated_subtotal !== null || x.quote.product_match || x.quote.unit_price != null))
+    .sort((a, b) => (a.quote.total ?? a.calculated_subtotal ?? Infinity) - (b.quote.total ?? b.calculated_subtotal ?? Infinity));
+  const confirmed = offers.filter(o => typeof o.quote.total === 'number');
+  const estimates = offers.filter(o => typeof o.quote.total !== 'number' && o.calculated_subtotal !== null);
+  const result = { offers, best: confirmed[0] ?? null, best_estimate: confirmed.length ? null : estimates[0] ?? null };
   db.prepare("UPDATE campaigns SET state='result_ready',result_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?").run(JSON.stringify(result), p.campaignId);
-  const body = offers.length ? `Negotiations are complete.\n\nBest confirmed quote: ${offers[0].seller} (${offers[0].phone})\nTotal quoted: ₹${offers[0].quote.total}${offers[0].quote.delivery ? `\nDelivery: ${offers[0].quote.delivery}` : ''}${offers[0].quote.validity ? `\nValid until: ${offers[0].quote.validity}` : ''}\nProduct: ${offers[0].url ?? 'see researched link'}\n\nOther confirmed offers: ${offers.slice(1).map(o => `${o.seller}: ₹${o.quote.total}`).join('; ') || 'none'}\n\nSend “recording” to hear the latest saved call. Quotes are seller statements; confirm details with the seller before payment.`
-    : 'Calls are complete, but I could not verify a complete comparable total from the transcripts. No price is being presented as a confirmed best quote. Send “recording” to hear the latest saved call.';
+  const summary = result.best
+    ? `Best seller-confirmed total: ${result.best.seller} — ₹${formatInr(result.best.quote.total)}.`
+    : result.best_estimate
+      ? `No seller-confirmed grand total is available. ${result.best_estimate.seller} quoted ₹${formatInr(result.best_estimate.quote.unit_price)} per unit for ${result.best_estimate.quote.quantity}; calculated subtotal ₹${formatInr(result.best_estimate.calculated_subtotal!)} (quantity × unit price), not confirmed by the seller as a grand total.`
+      : offers.length ? 'Partial quote details were collected; there is not enough confirmed pricing to calculate a comparable total.'
+        : 'Calls are complete, but no price details could be extracted from the transcripts.';
+  const body = `Negotiations are complete.\n\n${summary}${offers.map(o => `\n\n${o.seller}: ${o.quote.total != null ? `seller-confirmed total ₹${formatInr(o.quote.total)}` : o.quote.unit_price != null ? `₹${formatInr(o.quote.unit_price)} per unit${o.calculated_subtotal !== null ? `; calculated subtotal ₹${formatInr(o.calculated_subtotal)} (not seller-confirmed)` : ''}` : 'partial quote'}${o.quote.gst?.included ? '; GST included' : ''}${o.quote.shipping?.included ? '; shipping included' : ''}${o.quote.delivery ? `; delivery ${o.quote.delivery}` : ''}${o.quote.validity ? `; valid ${o.quote.validity}` : ''}`).join('')}\n\nSend “recording” to hear the latest saved call. The buyer decides whether to proceed.`;
   await notifyCampaign(p.campaignId, body);
 }
 
 async function notifyCampaign(campaignId: string, text: string) {
   const campaign = campaignFor(campaignId); const conversation = db.prepare('SELECT * FROM conversations WHERE id=?').get(campaign.conversation_id) as any;
-  await say(conversation.id, conversation.buyer_wa_id, text);
+  await say(conversation.id, conversation.buyer_wa_id, text, campaign.thread_id);
 }
 
 async function doSendRecording(p: any) {
   const call = db.prepare('SELECT * FROM calls WHERE id=?').get(p.callId) as any;
-  if (!call?.recording_path) { await say(p.conversationId, p.buyer, 'The recording file is not available yet.'); return; }
-  const messageId = await sendAudio(p.buyer, call.recording_path);
-  logMessage(p.conversationId, 'out', `Recording for call ${call.id}`, messageId);
+  const campaign = call ? campaignFor(call.campaign_id) : null;
+  if (!call?.recording_path) { await say(p.conversationId, p.buyer, 'The recording file is not available yet.', campaign?.thread_id); return; }
+  await say(p.conversationId, p.buyer, `Recording for call ${call.id} is available in the Calls panel.`, campaign?.thread_id);
 }
 
 export async function handleTool(name: string, body: any) {
@@ -315,7 +494,7 @@ export async function handleTool(name: string, body: any) {
 const runners: Record<string, (payload: any) => Promise<void>> = {
   research: doResearch, dispatch_call: dispatchCall, reconcile_call: doReconcile,
   advance_campaign: advanceCampaign, send_recording: doSendRecording,
-  process_message: async p => processBuyerMessage(p.buyer, p.text, p.messageId),
+  process_message: async p => processBuyerMessage(p.buyer, p.text, p.messageId, p.sellerContacts ?? [], p.threadId),
 };
 const activeJobs = new Set<number>();
 export function startWorker() {

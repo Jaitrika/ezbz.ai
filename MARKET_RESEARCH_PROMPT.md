@@ -1,5 +1,7 @@
 # Sauda market research agent: prompt and handoff contract
 
+> **Current direction:** Buyer interaction is through a protected browser console, not WhatsApp. The prompt remains useful, but WhatsApp-specific presentation details below are superseded. See [README.md](README.md) for the current flow.
+
 Planning draft for the WhatsApp-only product. This is not a deployed agent. The research agent runs in the backend with web tools; Bolna runs the separate seller-calling negotiation agent.
 
 ## Responsibilities

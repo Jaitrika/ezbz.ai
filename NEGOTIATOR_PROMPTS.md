@@ -1,5 +1,7 @@
 # Sauda negotiation agent: WhatsApp-authorized voice prompt drafts
 
+> **Current direction:** The buyer authorizes and reviews negotiations in the protected browser console; WhatsApp has been dropped. The seller-call prompt remains useful. WhatsApp-specific composer guidance below is superseded; see [README.md](README.md).
+
 These are editable planning artifacts, not deployed agents. Register the proposed tools in Bolna and test the prompts with real calls before using them with sellers. The backend must enforce amounts, call limits, and quote eligibility; a prompt is not a deterministic enforcement mechanism.
 
 The buyer interacts entirely through WhatsApp. A separate research agent supplies the sourced product brief and seller shortlist. “Call them all” authorizes the displayed sellers and one useful negotiation callback within the stated limits; do not seek buyer approval for each routine seller question or counteroffer. Buyer intent gaps are different from seller facts: resolve stock, fees, specifications and quote terms directly with the seller.

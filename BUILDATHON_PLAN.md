@@ -1,5 +1,7 @@
 # Sauda: autonomous purchasing research and negotiation on WhatsApp
 
+> **Current direction:** The buyer interface is now a protected browser console; WhatsApp has been dropped. The original plan below is superseded where it describes the buyer channel. See [README.md](README.md) for the implemented flow.
+
 Revised plan · 31 October 2026 · India only · One buyer · Two agents · Bolna voice calls
 
 This document supersedes the web-app plan. WhatsApp is the complete buyer interface: product intake, clarification, seller shortlist, authorization, progress, corrections, recordings, and the final seller handoff. There is no buyer dashboard. This is a planning artifact; no application, provider configuration, call, or message has been created.
@@ -14,7 +16,7 @@ The buyer should normally send only two substantive messages: the initial reques
 
 The final handoff includes the product/variant, seller's business and phone number, source link, agreed price and conditions, delivery, quote validity, and how to proceed. The buyer calls or pays the seller directly. The bot does not make payments or infer that the deal has closed merely because it delivered a quote.
 
-Pilot scope: one buyer, one active request, three callable sellers by default and up to five displayed callable sellers, two negotiation rounds, Hindi/English automatic switching, persisted WhatsApp messages and calls, recordings returned inside WhatsApp. The product category remains open-ended.
+Pilot scope: one buyer, one active request, up to ten displayed callable sellers, two negotiation rounds, Hindi/English automatic switching, persisted WhatsApp messages and calls, recordings returned inside WhatsApp. The product category remains open-ended.
 
 ## 2. Example WhatsApp conversation
 
@@ -111,7 +113,7 @@ Interpret “Juststyle” as Justdial unless corrected. OLX/Quikr are possible d
 
 “Available sellers” means sellers found during this bounded search, not an exhaustive list of every seller in India. The message should say “I found three callable matches,” not “These are all available sellers.” Research can find more than the displayed callable shortlist and explain that others lacked an attributable phone number.
 
-Suggested pilot search budget: up to three query passes and 15 candidate listings, stopping after three strong callable matches; show up to five when useful. These are engineering defaults, not promises about coverage. Surface a partial result when search times out.
+Suggested pilot search budget: up to three query passes and 15 candidate listings, returning up to ten strong callable matches. These are engineering defaults, not promises about coverage. Surface a partial result when search times out.
 
 Keep blocked or inaccessible pages explicit. Search additional public sources before asking for help. The buyer should not normally paste phone numbers or manually import sellers. An operator-assisted rehearsal is a labelled fallback, not proof that autonomous discovery works.
 
@@ -171,7 +173,7 @@ Negotiation follows the same rules in Hindi and English:
 
 Keep arithmetic, permitted amounts, scope and call limits in code. The model receives the next allowed move rather than the private maximum budget. A prompt improves spoken behavior but cannot guarantee flawless speech.
 
-Default caps: three sellers, up to two simultaneous calls if permitted, 180 seconds per first call, 120 seconds per negotiation callback. Allow one delayed retry for busy/no-answer within the campaign's disclosed time/attempt budget; do not automatically redial refusals. Carrier retries are off so the app owns retry decisions. Exact retry intervals must suit seller availability and the demo window.
+Default caps: ten sellers, up to two simultaneous calls if permitted, 180 seconds per first call, 120 seconds per negotiation callback. Allow one delayed retry for busy/no-answer within the campaign's disclosed time/attempt budget; do not automatically redial refusals. Carrier retries are off so the app owns retry decisions. Exact retry intervals must suit seller availability and the demo window.
 
 Call failures, unresolved product matches, and non-comparable offers are reported as such. Finalize with partial results when needed, listing whom the agent could not reach.
 

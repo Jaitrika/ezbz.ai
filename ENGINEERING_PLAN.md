@@ -1,5 +1,7 @@
 # Sauda engineering plan: one server, SQLite, OpenAI, and Bolna
 
+> **Current direction:** The buyer interface is now a protected browser console; WhatsApp has been dropped. The original plan below is superseded where it describes the buyer channel. See [README.md](README.md) for the implemented flow.
+
 31 October 2026 · Planning only · WhatsApp-only buyer interface · One buyer · India
 
 ## 1. Decisions
@@ -37,7 +39,7 @@ The complete happy path:
 
 Also include status queries, one necessary clarification, corrections, seller exclusion, stop/resume, failure results and recovery after a server restart.
 
-Start with three sellers, two negotiation rounds, two concurrent calls if the account supports them, and one active purchase request. Make seller count configurable up to five. Every seller in the displayed authorized list gets a first attempt; an unavailable number or a refusal produces an honest outcome, not a fabricated offer.
+Research up to ten sellers by default, with a hard configurable cap of ten, two negotiation rounds, two concurrent calls if the account supports them, and one active purchase request. Every seller in the displayed authorized list gets a first attempt; an unavailable number or a refusal produces an honest outcome, not a fabricated offer.
 
 The agents obtain quotes. The buyer independently completes the purchase. Product facts should be researched; missing buyer intent should not be guessed. No budget is required to collect offers.
 
@@ -366,7 +368,7 @@ Environment:
 
 Use the supported current WhatsApp Graph version selected during setup rather than an old copied example. Secrets live in deployment configuration or an ignored local .env, not in prompts or source control.
 
-Defaults in config.ts: three sellers, two concurrent calls, two rounds, one failed-call retry per seller, three research passes, a campaign deadline, network timeouts, and bounded response sizes.
+Defaults in config.ts: up to ten sellers, two concurrent calls, two rounds, one failed-call retry per seller, three research passes, a campaign deadline, network timeouts, and bounded response sizes.
 
 The arbitrary product-link fetcher must reject private/internal/file destinations, revalidate redirects and resolved addresses, cap downloads and avoid forwarding credentials. Provider calls and buyer messages are also scoped server-side. These are small controls directly required by the app's inputs, not a separate compliance project.
 

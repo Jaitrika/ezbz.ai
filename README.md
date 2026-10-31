@@ -1,48 +1,48 @@
 # Sauda
 
-WhatsApp-first purchasing assistant for one buyer. The app researches a buyer-selected product, presents sourced Indian sellers, and waits for the buyer to authorize calls. Bolna handles the live calls; OpenAI handles web research and transcript quote extraction. SQLite and a local persistent directory hold the campaign, messages, transcripts, and audio.
+Minimal web console for a single buyer to research products and run real supplier calls. The browser UI replaces the WhatsApp interface. OpenAI Responses API handles product research and quote extraction; Bolna handles live calls, call recordings, and transcripts. SQLite and a local persistent directory store campaigns and call artifacts.
 
-## Start locally
+## Run locally
 
-Requires Node.js 22 or newer. Install dependencies with `npm install`, copy `.env.example` to `.env`, fill what is available, then run `npm run dev`. The service starts without provider credentials; provider work reports a configuration error until the corresponding credentials are supplied.
+Requires Node.js 22 or newer.
 
-Set `PUBLIC_BASE_URL` to an HTTPS URL that can receive provider webhooks. Configure the Meta WhatsApp webhook at `/webhooks/whatsapp` for `messages`; configure the Bolna agent to call `/webhooks/bolna`. Mount `DATA_DIR` on persistent storage in deployment.
+```sh
+npm install
+npm run build
+npm run dev
+```
 
-Environment values:
+Open `http://localhost:3000`. Set the local values in `.env` first. This hackathon dashboard has no login or access-key gate; anyone who can reach it can view the demo and authorize real outbound calls. Keep it on a trusted network and stop the public tunnel when finished.
 
-- `OPENAI_API_KEY`, `OPENAI_MODEL`: Responses API search and call transcript extraction.
-- `BOLNA_API_KEY`, `BOLNA_AGENT_ID`, optionally `BOLNA_FROM_NUMBER`: outbound calls. Bolna's configured agent must have Hindi and English speech, automatic language switching, recording enabled, and callback tooling enabled.
-- `WHATSAPP_ACCESS_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_APP_SECRET`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_GRAPH_VERSION`: WhatsApp Cloud API webhooks and messages.
-- `ALLOWED_BUYER_WA_ID`: optional single-buyer allowlist, digits only, including country code.
-- `BOLNA_TOOL_SECRET`, `BOLNA_WEBHOOK_SECRET`: shared secrets for the tool and webhook routes. For Bolna, configure `x-tool-secret` as a custom header if supported; otherwise include `tool_secret` in the body. Configure the webhook secret as `x-bolna-secret` or `secret`.
-- `DATA_DIR`: persistent SQLite and recording directory. Defaults to `./data`.
+## Required settings
 
-## WhatsApp journey
+- `BOLNA_OPEN_AI_HACK_KEY` or `OPENAI_API_KEY`: key used by the app for product research and post-call quote extraction.
+- `OPENAI_MODEL`: currently `gpt-6-luna`, which supports Responses API web search.
+- `BOLNA_API_KEY` and `BOLNA_AGENT_ID`: authorize outbound calls through the configured Bolna agent.
+- `BOLNA_FROM_NUMBER`: optional caller ID if required by the Bolna account.
+- `BOLNA_TOOL_SECRET`: shared secret required by the app's Bolna custom-tool endpoints. Configure Bolna to send it as `x-tool-secret` or in the request body.
+- `BOLNA_WEBHOOK_SECRET`: optional shared secret, if the Bolna webhook can send the configured value as `x-bolna-secret` or `secret`.
+- `PUBLIC_BASE_URL`: public HTTPS base URL for Bolna webhooks and custom tools. A temporary tunnel URL works for local E2E testing.
+- `DATA_DIR`: persistent directory for SQLite and audio; defaults to `./data`.
 
-1. Send a public product URL or plain-language product request. Include quantity, city/PIN and delivery timing if known.
-2. Sauda replies with the product summary, sellers, public sources, phone verification status, and any unresolved product questions.
-3. Reply `Call them all` to authorize first-round calls to every verified seller in the displayed shortlist. Unverified contacts are never dialed.
-4. Use `status`, `stop`, or `resume` to control the active campaign. Use `exclude seller [name]` before calls, `compare` for offers, `transcript [seller]` for transcripts, `correct [seller] to ₹[total]` to correct an extracted amount, and `recording` to receive the latest saved call audio.
+The app exposes `POST /webhooks/bolna` and `POST /bolna/tools/<tool-name>`. Configure the webhook and four tools (`get_negotiation_brief`, `capture_quote`, `next_negotiation_move`, `record_followup`) in the Bolna agent. See `prompts/negotiator-en.md` and `prompts/bolna-tools.json`.
 
-The initial version deliberately supports one active campaign for the configured buyer. A campaign cannot place an order or make payment. Do not present a quote as comparable unless the seller and full total are confirmed. A recording request returns an actual saved provider recording; it does not synthesize replacement audio.
+## Buyer flow
 
-## Bolna agent setup
+1. Chat naturally in one box: describe the product, paste links, and include seller names and numbers in the same message. The OpenAI intake prompt turns explicit contacts into structured JSON; up to 10 Indian numbers are accepted.
+2. Review the product brief and seller shortlist. Buyer-supplied numbers are labeled as such and are not independently verified. If no numbers are supplied, the app researches sellers on the web.
+3. Click **Call all ready sellers**. This is the explicit authorization for real outbound calls.
+4. Watch call statuses, review extracted offers and transcripts, and play recordings saved on the server.
+5. Use the chat box for `status`, `stop`, `resume`, `compare`, `transcript`, `recording`, seller exclusion, and quote correction commands.
 
-Use `prompts/negotiator-en.md` as the system prompt and configure Hindi/English automatic switching. Enable recording and final transcript/recording availability in the Bolna account. Set the webhook URL to `${PUBLIC_BASE_URL}/webhooks/bolna`. Add custom tools targeting `${PUBLIC_BASE_URL}/bolna/tools/<tool-name>`:
+The demo supports one active buyer/campaign. No call is placed by opening the page or researching a product. A listing or phone number returned by web search is not independently guaranteed; check the seller evidence before authorizing calls. Quotes are seller statements, not purchase commitments.
 
-- `get_negotiation_brief`
-- `capture_quote`
-- `next_negotiation_move`
-- `record_followup`
-
-Use `prompts/bolna-tools.json` for the function names, primitive argument schemas and endpoint mapping. Verify Bolna's exact custom-function URL and auth-header configuration in the account before allowing live calls. The app binds tool calls to `app_call_id` in call context.
-
-## Service routes
+## Server routes
 
 - `GET /health`
-- `GET /webhooks/whatsapp`
-- `POST /webhooks/whatsapp`
+- `GET /` — buyer console
+- `GET /api/state`, `POST /api/messages`, `GET /api/recordings/:callId` — demo endpoints without authentication
 - `POST /webhooks/bolna`
 - `POST /bolna/tools/:name`
 
-Provider API shapes and account-specific limits need a live integration pass after credentials are available. No test calls or messages are sent automatically by starting the server.
+The backend currently uses OpenAI web search for discovery; it does not use IndiaMART or Justdial APIs. Provider calls, webhook payload mapping, Hindi/English behavior, and actual recording formats still need live integration testing with the configured accounts.

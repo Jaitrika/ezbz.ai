@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sauda — buyer console</title>
+  <style>
+    :root { color-scheme: light; font: 15px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #20211f; background: #f5f5f2; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header { display:flex; align-items:center; justify-content:space-between; padding:18px max(22px,calc((100vw - 1180px)/2)); background:#fff; border-bottom:1px solid #e7e7e2; position:sticky; top:0; z-index:2; }
+    .brand { font-weight:750; font-size:20px; letter-spacing:-.04em; } .subtle { color:#77796f; font-size:13px; }
+    main { max-width:1180px; margin:26px auto; padding:0 20px 50px; display:grid; grid-template-columns:minmax(0,1.25fr) minmax(310px,.75fr); gap:18px; }
+    .panel { background:#fff; border:1px solid #e7e7e2; border-radius:14px; padding:20px; box-shadow:0 2px 12px #25250a08; }
+    h1,h2,h3,p { margin-top:0; } h1 { font-size:24px; letter-spacing:-.04em; margin-bottom:4px; } h2 { font-size:16px; margin-bottom:15px; } h3 { font-size:15px; margin-bottom:5px; }
+    .wide { grid-column:1/-1; } .toolbar { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+    .status { padding:5px 10px; border-radius:99px; background:#f1f1ed; color:#65665f; font-size:12px; text-transform:uppercase; font-weight:700; letter-spacing:.04em; }
+    textarea,input { width:100%; border:1px solid #d9dad3; border-radius:9px; background:#fff; font:inherit; padding:11px 12px; outline:none; }
+    textarea:focus,input:focus { border-color:#71845a; box-shadow:0 0 0 3px #71845a1c; }
+    textarea { min-height:88px; resize:vertical; }
+    button { border:0; background:#20211f; color:#fff; border-radius:9px; padding:10px 14px; font:600 14px inherit; cursor:pointer; }
+    button:hover { background:#41433d; } button:disabled { opacity:.45; cursor:not-allowed; }
+    button.secondary { background:#f0f0eb; color:#30312d; } button.danger { background:#9d3a32; }
+    .chat { display:flex; flex-direction:column; gap:10px; max-height:510px; min-height:150px; overflow:auto; margin:14px 0; padding:2px; }
+    .bubble { max-width:88%; white-space:pre-wrap; overflow-wrap:anywhere; padding:10px 12px; border-radius:12px; background:#f2f2ee; align-self:flex-start; }
+    .bubble.in { background:#e8eee1; align-self:flex-end; } .time { color:#77796f; font-size:11px; margin-top:4px; }
+    .seller,.call { border:1px solid #ecece7; border-radius:11px; padding:13px; margin-top:10px; }
+    .chat-nav { display:flex; gap:8px; overflow:auto; padding:2px 0; } .chat-tab { flex:0 0 auto; max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .seller-top,.call-top { display:flex; justify-content:space-between; gap:12px; align-items:flex-start; }
+    .seller a { color:#47663a; overflow-wrap:anywhere; } .evidence { color:#686a63; font-size:13px; margin:7px 0 0; }
+    .call-meta { color:#77796f; font-size:13px; } .quote { margin-top:8px; padding:9px; background:#f6f6f3; border-radius:8px; white-space:pre-wrap; }
+    .transcript { margin:8px 0 0; color:#55574f; font-size:13px; white-space:pre-wrap; max-height:230px; overflow:auto; }
+    .empty { color:#86877f; font-size:14px; padding:12px 0; } .notice { font-size:12px; color:#77796f; } .error { color:#a2352c; font-size:13px; }
+    @media (max-width:820px) { main { grid-template-columns:1fr; } .wide { grid-column:auto; } header { padding:14px 18px; } }
+  </style>
+</head>
+<body>
+  <header><div><div class="brand">Sauda</div><div class="subtle">Buyer console · one demo buyer</div><div id="appError" class="error"></div></div><div class="toolbar"><span id="campaignStatus" class="status">Ready</span><button id="stopBtn" class="secondary" hidden>Stop calls</button><button id="resumeBtn" class="secondary" hidden>Resume</button></div></header>
+  <main>
+    <section class="panel wide"><div class="toolbar" style="justify-content:space-between"><div><h2 style="margin-bottom:2px">Your chats</h2><div class="subtle">Each chat keeps its own product, seller quotes, calls, and history.</div></div><button id="newChatBtn">＋ New chat</button></div><div id="chatList" class="chat-nav" style="margin-top:12px"></div></section>
+    <section class="panel">
+      <h1>Chat with Sauda</h1><p class="subtle">Tell me what you want to buy, paste links, include seller names or phone numbers, and add details naturally as we go.</p>
+      <form id="messageForm"><textarea id="messageInput" placeholder="Example: I need 100 custom printed 180 GSM cotton T-shirts delivered to Hyderabad. Also call Meera Textiles at +91 98765 43210 and Sunil Garments at 9876543210. Here is one listing: https://example.com/item"></textarea><div class="notice" style="margin-top:8px">I’ll organize the product details and up to 10 seller contacts. Review the shortlist; calls begin only after you choose “Call all sellers”.</div><div class="toolbar" style="justify-content:space-between;margin-top:10px"><span class="notice">Product research and seller calls happen in this conversation.</span><button id="sendBtn">Send</button></div></form>
+      <div id="chat" class="chat"></div>
+    </section>
+    <section class="panel">
+      <div class="toolbar" style="justify-content:space-between"><h2>Product brief</h2><span id="campaignId" class="notice"></span></div>
+      <div id="brief" class="empty">No request yet.</div>
+      <h2 style="margin-top:22px">Seller shortlist</h2>
+      <div id="sellers" class="empty">Research a product to find sellers.</div>
+      <button id="callAllBtn" style="width:100%;margin-top:14px" disabled>Call all ready sellers</button>
+    </section>
+    <section class="panel wide">
+      <div class="toolbar" style="justify-content:space-between"><div><h2 style="margin-bottom:2px">Calls and offers</h2><div class="subtle">Recordings and transcripts stay on this server.</div></div><button id="refreshBtn" class="secondary">Refresh</button></div>
+      <div id="calls" class="empty">No calls yet.</div>
+      <div id="result"></div>
+    </section>
+  </main>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    let state = null;
+    let currentChatId = localStorage.getItem('sauda-chat-id') || '';
+    const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    const formatInr = (value) => Number(value).toLocaleString('en-IN', { maximumFractionDigits: 2 });
+    const safeHref = (s) => { try { const u=new URL(s); return ['https:','http:'].includes(u.protocol)?escapeHtml(u.href):''; } catch { return ''; } };
+    async function api(url, options={}) {
+      const response = await fetch(url, options);
+      const type = response.headers.get('content-type') || '';
+      if (!response.ok) { let message='Request failed'; try { message=(await response.json()).error || message; } catch {} throw new Error(message); }
+      return type.includes('application/json') ? response.json() : response;
+    }
+    function showError(error) { $('#appError').textContent = error.message; }
+    initialize().catch(showError);
+    $('#messageForm').addEventListener('submit', async e => {
+      e.preventDefault(); const input=$('#messageInput'); const text=input.value.trim(); if(!text)return;
+      $('#sendBtn').disabled=true;
+      const control=/^(status|progress|compare|quotes|offers|transcript|recording|stop|pause|cancel|resume|call them all|call all)\b/i.test(text);
+      const alreadyNew=/^new:\s*/i.test(text);
+      const message=state?.campaign?.state==='result_ready'&&!control&&!alreadyNew?`new: ${text}`:text;
+      try { await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text:message,chatId:currentChatId})}); input.value=''; await refresh(); }
+      catch(err){ showError(err); }
+      finally { $('#sendBtn').disabled=false; }
+    });
+    async function sendCommand(text) { try { await api('/api/messages',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({text,chatId:currentChatId})}); await refresh(); } catch(e){showError(e);} }
+    $('#newChatBtn').addEventListener('click',async()=>{
+      try { const created=await api('/api/chats',{method:'POST'}); currentChatId=created.chatId; localStorage.setItem('sauda-chat-id',currentChatId); $('#messageInput').value=''; await refresh(); }
+      catch(e){showError(e);}
+    });
+    $('#callAllBtn').addEventListener('click',()=>sendCommand('Call them all'));
+    $('#stopBtn').addEventListener('click',()=>sendCommand('stop'));
+    $('#resumeBtn').addEventListener('click',()=>sendCommand('resume'));
+    $('#refreshBtn').addEventListener('click',refresh);
+    function render() {
+      if (!state) return;
+      if (state.chatId && state.chatId !== currentChatId) { currentChatId=state.chatId; localStorage.setItem('sauda-chat-id',currentChatId); }
+      renderChatList().catch(showError);
+      const c=state.campaign;
+      $('#campaignStatus').textContent=c?.state?.replaceAll('_',' ') || 'Ready';
+      $('#campaignId').textContent=c ? c.id.slice(0,8) : '';
+      $('#stopBtn').hidden=!c || !['collecting','renegotiating','researching','validating'].includes(c.state);
+      $('#resumeBtn').hidden=!c || c.state!=='paused';
+      $('#chat').innerHTML=state.messages.map(m=>`<div class="bubble ${m.direction==='in'?'in':''}">${escapeHtml(m.content)}<div class="time">${escapeHtml(m.created_at)}</div></div>`).join('') || '<div class="empty">Send a product description or link to begin.</div>';
+      $('#chat').scrollTop=$('#chat').scrollHeight;
+      $('#brief').innerHTML=c?.brief ? `<strong>${escapeHtml(c.brief.product_summary)}</strong><p>${escapeHtml((c.brief.product_attributes||[]).join(', '))}</p>${c.brief.missing_questions?.length?`<div class="notice">Needs clarification: ${escapeHtml(c.brief.missing_questions.join('; '))}</div>`:''}` : '<div class="empty">No researched product yet.</div>';
+      $('#sellers').innerHTML=state.sellers.length ? state.sellers.map((s,i)=>{const product=safeHref(s.product_url);const source=safeHref(s.source_url);const ready=['verified','buyer_provided'].includes(s.match_state);const phoneLabel=s.match_state==='buyer_provided'?'Buyer-supplied number':ready?'Research-verified number':'Phone not verified — cannot call';return `<article class="seller"><div class="seller-top"><div><h3>${i+1}. ${escapeHtml(s.business_name)}</h3><div class="call-meta">${ready?escapeHtml(s.phone_e164):'Phone not verified — cannot call'} · ${phoneLabel}</div></div><span class="status">${escapeHtml(s.match_state==='buyer_provided'?'buyer supplied':s.match_state)}</span></div>${product?`<div><a href="${product}" target="_blank" rel="noreferrer">Product listing</a></div>`:''}${source?`<div><a href="${source}" target="_blank" rel="noreferrer">Source</a></div>`:''}<p class="evidence">${escapeHtml(s.evidence)}</p></article>`;}).join('') : (c ? '<div class="empty">No seller candidates returned.</div>' : '<div class="empty">Research a product to find sellers.</div>');
+      const callable=state.sellers.filter(s=>['verified','buyer_provided'].includes(s.match_state)&&s.phone_e164&&!s.excluded);
+      $('#callAllBtn').disabled=!c || c.state!=='shortlist_ready' || callable.length===0;
+      $('#callAllBtn').textContent=callable.length?`Call all ${callable.length} ready sellers`:'No callable sellers in shortlist';
+      $('#calls').innerHTML=state.calls.length?state.calls.map(call=>{
+        const q=call.quote && typeof call.quote==='object'?Object.entries(call.quote).filter(([k,v])=>v!==null&&v!==undefined&&k!=='raw').map(([k,v])=>`${k.replaceAll('_',' ')}: ${typeof v==='object'?JSON.stringify(v):v}`).join('\n'):'';
+        return `<article class="call"><div class="call-top"><div><h3>${escapeHtml(call.business_name)} · Round ${call.round}</h3><div class="call-meta">${escapeHtml(call.phone_e164||'No phone')} · ${escapeHtml(call.state)}</div></div><span class="status">${escapeHtml(call.state)}</span></div>${q?`<div class="quote">${escapeHtml(q)}</div>`:''}${call.recording_path?`<button class="secondary play" data-call="${escapeHtml(call.id)}" style="margin-top:10px">Play recording</button><audio controls class="audio" data-audio="${escapeHtml(call.id)}" style="display:block;width:100%;margin-top:8px"></audio>`:''}${call.transcript?`<details style="margin-top:10px"><summary>Transcript</summary><div class="transcript">${escapeHtml(call.transcript)}</div></details>`:''}</article>`;
+      }).join(''):'<div class="empty">Calls will appear here after authorization.</div>';
+      document.querySelectorAll('.play').forEach(button=>button.addEventListener('click',async()=>{
+        button.disabled=true; try { const response=await api(`/api/recordings/${encodeURIComponent(button.dataset.call)}`); const blob=await response.blob(); const player=document.querySelector(`[data-audio="${CSS.escape(button.dataset.call)}"]`); player.src=URL.createObjectURL(blob); await player.play(); } catch(e){showError(e);} finally{button.disabled=false;}
+      }));
+      if(c?.result){const summary=c.result.best?`Best seller-confirmed total: ₹${formatInr(c.result.best.quote?.total)} — ${escapeHtml(c.result.best.seller)}`:c.result.best_estimate?`No seller-confirmed grand total. ${escapeHtml(c.result.best_estimate.seller)} quoted ₹${formatInr(c.result.best_estimate.quote?.unit_price)} per unit for ${escapeHtml(c.result.best_estimate.quote?.quantity)}. Calculated subtotal: ₹${formatInr(c.result.best_estimate.calculated_subtotal)}; the seller did not confirm this as a grand total.`:'No complete comparable total confirmed; review the call cards for partial quote details.';const lines=(c.result.offers||[]).map(o=>{const q=o.quote||{};const price=q.total!=null?`seller-confirmed total ₹${formatInr(q.total)}`:q.unit_price!=null?`₹${formatInr(q.unit_price)} per unit${o.calculated_subtotal!=null?`; calculated subtotal ₹${formatInr(o.calculated_subtotal)} (not seller-confirmed)`:''}`:'partial quote';const terms=[q.gst?.included?'GST included':'',q.shipping?.included?'shipping included':'',q.delivery?`delivery ${q.delivery}`:'',q.validity?`valid ${q.validity}`:''].filter(Boolean).join(' · ');return `<li><strong>${escapeHtml(o.seller)}</strong>: ${escapeHtml(price)}${terms?`<br><span class="notice">${escapeHtml(terms)}</span>`:''}</li>`}).join('');$('#result').innerHTML=`<div class="seller"><h3>Campaign result</h3><p>${summary}</p>${lines?`<ul>${lines}</ul>`:''}<button id="compareBtn" class="secondary">Refresh comparison</button></div>`;}else $('#result').innerHTML='';
+      $('#compareBtn')?.addEventListener('click',()=>sendCommand('compare'));
+    }
+    async function renderChatList() {
+      const response=await api('/api/chats');
+      $('#chatList').innerHTML=response.chats.map(chat=>`<button class="secondary chat-tab" data-chat="${escapeHtml(chat.id)}" title="${escapeHtml(chat.product||chat.first_message||'New chat')}">${escapeHtml(chat.title==='New chat'?(chat.product||chat.first_message||'New chat'):chat.title)}${chat.id===currentChatId?' · Open':''}</button>`).join('');
+      document.querySelectorAll('.chat-tab').forEach(button=>button.addEventListener('click',async()=>{
+        if(button.dataset.chat===currentChatId)return;
+        currentChatId=button.dataset.chat; localStorage.setItem('sauda-chat-id',currentChatId); $('#appError').textContent=''; await refresh();
+      }));
+    }
+    async function initialize() {
+      const response=await api('/api/chats');
+      if(!response.chats.some(chat=>chat.id===currentChatId)) currentChatId=response.defaultChatId;
+      localStorage.setItem('sauda-chat-id',currentChatId);
+      await refresh();
+    }
+    async function refresh() { state=await api(`/api/state${currentChatId?`?chatId=${encodeURIComponent(currentChatId)}`:''}`); render(); }
+    setInterval(refresh,3000);
+  </script>
+</body>
+</html>
