@@ -1,48 +1,104 @@
 # ezbz.ai
 
-Minimal web console for a single buyer to research products and run real supplier calls. The browser UI replaces the WhatsApp interface. OpenAI Responses API handles product research and quote extraction; Bolna handles live calls, call recordings, and transcripts. SQLite and a local persistent directory store campaigns and call artifacts.
+ezbz.ai is a buyer-side sourcing and negotiation workspace. A buyer describes a product or shares a listing, reviews the researched shortlist, then authorizes outbound calls to sellers. The app records call status, transcripts, recordings, extracted quotes, and seller quote history.
+
+## Features
+
+- Conversational product intake with OpenAI Responses API and web search.
+- Seller discovery with product links, public source links, and evidence for extracted contact details.
+- Explicit buyer approval before outbound calls through Bolna.
+- Hindi and English negotiation instructions, with call transcripts and recordings stored locally.
+- Quote comparison, call-again rounds, per-seller call controls, and soft deletion for chats.
+- A SQLite seller directory keyed by a seller's phone number, product URL, or business name. Product records retain the latest quote and price basis; quote history records earlier prices, rounds, and changes.
+- A three-column responsive web interface with chat history, call activity, seller details, and quote comparison.
+
+## Requirements
+
+- Node.js 22 or newer
+- OpenAI API access for intake, web research, and quote extraction
+- A configured Bolna agent and outbound calling account
+- A public HTTPS URL for Bolna webhooks and custom tools when testing locally
 
 ## Run locally
 
-Requires Node.js 22 or newer.
-
 ```sh
 npm install
-npm run build
+cp .env.example .env
+```
+
+Set the required values in `.env`, then run the development UI and API:
+
+```sh
 npm run dev
 ```
 
-Open `http://localhost:3000`. Set the local values in `.env` first. This hackathon dashboard has no login or access-key gate; anyone who can reach it can view the demo and authorize real outbound calls. Keep it on a trusted network and stop the public tunnel when finished.
+Open [http://localhost:3000](http://localhost:3000). For a production-style local run, build the frontend and start the API server:
 
-## Required settings
+```sh
+npm run build
+npm start
+```
 
-- `BOLNA_OPEN_AI_HACK_KEY` or `OPENAI_API_KEY`: key used by the app for product research and post-call quote extraction.
-- `OPENAI_MODEL`: currently `gpt-6-luna`, which supports Responses API web search.
-- `BOLNA_API_KEY` and `BOLNA_AGENT_ID`: authorize outbound calls through the configured Bolna agent.
-- `BOLNA_FROM_NUMBER`: optional caller ID if required by the Bolna account.
-- `BOLNA_TOOL_SECRET`: shared secret required by the app's Bolna custom-tool endpoints. Configure Bolna to send it as `x-tool-secret` or in the request body.
-- `BOLNA_WEBHOOK_SECRET`: optional shared secret, if the Bolna webhook can send the configured value as `x-bolna-secret` or `secret`.
-- `PUBLIC_BASE_URL`: public HTTPS base URL for Bolna webhooks and custom tools. A temporary tunnel URL works for local E2E testing.
-- `DATA_DIR`: persistent directory for SQLite and audio; defaults to `./data`.
+The server defaults to port `3000`. In development, Vite serves the UI on port `3000` and proxies API requests to the backend on port `3001`.
 
-The app exposes `POST /webhooks/bolna` and `POST /bolna/tools/<tool-name>`. Configure the webhook and four tools (`get_negotiation_brief`, `capture_quote`, `next_negotiation_move`, `record_followup`) in the Bolna agent. See `prompts/negotiator-en.md` and `prompts/bolna-tools.json`.
+## Configuration
 
-## Buyer flow
+At least one OpenAI key and the Bolna API key and agent ID are required for the full call workflow.
 
-1. Chat naturally in one box: describe the product, paste links, and include seller names and numbers in the same message. The OpenAI intake prompt turns explicit contacts into structured JSON; up to 10 Indian numbers are accepted.
-2. Review the product brief and seller shortlist. Buyer-supplied numbers are labeled as such and are not independently verified. If no numbers are supplied, the app researches sellers on the web.
-3. Click **Call all ready sellers**. This is the explicit authorization for real outbound calls.
-4. Watch call statuses, review extracted offers and transcripts, and play recordings saved on the server.
-5. Use the chat box for `status`, `stop`, `resume`, `compare`, `transcript`, `recording`, seller exclusion, and quote correction commands.
+| Variable | Purpose |
+| --- | --- |
+| `OPENAI_API_KEY` | OpenAI API key for intake, research, and quote extraction. |
+| `BOLNA_OPEN_AI_HACK_KEY` | Optional alternate key name; used if `OPENAI_API_KEY` is empty. |
+| `OPENAI_MODEL` | Responses API model; defaults to `gpt-6-luna`. |
+| `BOLNA_API_KEY` | Bolna API authentication. |
+| `BOLNA_AGENT_ID` | Bolna outbound agent ID. |
+| `BOLNA_FROM_NUMBER` | Optional configured caller ID. |
+| `BOLNA_TOOL_SECRET` | Secret checked by the Bolna custom-tool endpoints. |
+| `BOLNA_WEBHOOK_SECRET` | Optional webhook signature secret. |
+| `PUBLIC_BASE_URL` | Public HTTPS base URL used to configure Bolna webhooks and tools. |
+| `DATA_DIR` | SQLite and recording storage directory; defaults to `./data`. |
+| `MAX_SELLERS` | Maximum sellers per campaign, capped at 10; defaults to 10. |
+| `MAX_CONCURRENT_CALLS` | Maximum concurrent outbound calls; defaults to 2. |
 
-The demo supports one active buyer/campaign. No call is placed by opening the page or researching a product. A listing or phone number returned by web search is not independently guaranteed; check the seller evidence before authorizing calls. Quotes are seller statements, not purchase commitments.
+Keep `.env` private and do not commit it. The example file documents the expected variable names.
 
-## Server routes
+## Buyer workflow
 
-- `GET /health`
-- `GET /` — buyer console
-- `GET /api/state`, `POST /api/messages`, `GET /api/recordings/:callId` — demo endpoints without authentication
-- `POST /webhooks/bolna`
-- `POST /bolna/tools/:name`
+1. Describe the product or paste a product link. Seller names and Indian phone numbers can be included in the same message.
+2. Review the product brief, seller shortlist, source links, and contact evidence. Web search does not guarantee a seller's identity or current availability.
+3. Select **Call all sellers** to authorize outbound calls, or call a listed seller individually.
+4. Review call progress, transcripts, extracted quotes, and available recordings. The buyer remains responsible for deciding whether to purchase.
+5. Ask for another call round or compare the quotes from the same chat.
 
-The backend currently uses OpenAI web search for discovery; it does not use IndiaMART or Justdial APIs. Provider calls, webhook payload mapping, Hindi/English behavior, and actual recording formats still need live integration testing with the configured accounts.
+Calls are not started by opening the app or researching a product. A contact supplied by the buyer is labeled as buyer-supplied; the app does not independently verify that contact's identity.
+
+## Seller quote history
+
+The backend stores seller profiles in `seller_directory`, product-specific records in `seller_products`, and individual quote records in `seller_quote_history`. A new quote updates the current product price while preserving prior quote values and the round in which each was collected. Seller matching currently uses the phone number when available, then the listing URL, then the business name.
+
+## Bolna setup
+
+Set `PUBLIC_BASE_URL` to the public HTTPS address that Bolna can reach, then configure these app endpoints in the Bolna agent:
+
+- Webhook: `POST /webhooks/bolna`
+- Custom tools: `POST /bolna/tools/:name`
+- Tools: `get_negotiation_brief`, `capture_quote`, `next_negotiation_move`, and `record_followup`
+
+The prompt and tool payload examples are in [`prompts/negotiator-en.md`](prompts/negotiator-en.md) and [`prompts/bolna-tools.json`](prompts/bolna-tools.json).
+
+## API routes
+
+- `GET /health` — service and database status.
+- `GET /api/chats`, `POST /api/chats`, `DELETE /api/chats/:chatId` — chat history and soft deletion.
+- `GET /api/state?chatId=<id>` — messages, sellers, calls, campaign, and quote history for a chat.
+- `POST /api/messages` — submit a buyer message.
+- `POST /api/chats/:chatId/sellers/:sellerId/call` — authorize a call to one seller.
+- `GET /api/recordings/:callId` — stream a saved recording.
+- `POST /webhooks/bolna` — Bolna call events.
+- `POST /bolna/tools/:name` — Bolna agent tools.
+
+## Scope and limitations
+
+This is a single-buyer application using SQLite and local recording storage. Seller discovery uses OpenAI web search; there are no direct IndiaMART or Justdial API integrations. Provider behavior, webhooks, regional-language handling, and recording downloads should be verified with the configured OpenAI and Bolna accounts before relying on them.
+
+The web console currently has no user authentication. Keep it on a trusted network and restrict access to any public tunnel.
