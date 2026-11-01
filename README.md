@@ -70,8 +70,6 @@ Keep `.env` private and do not commit it. The example file documents the expecte
 4. Review call progress, transcripts, extracted quotes, and available recordings. The buyer remains responsible for deciding whether to purchase.
 5. Ask for another call round or compare the quotes from the same chat.
 
-Calls are not started by opening the app or researching a product. A contact supplied by the buyer is labeled as buyer-supplied; the app does not independently verify that contact's identity.
-
 ## Seller quote history
 
 The backend stores seller profiles in `seller_directory`, product-specific records in `seller_products`, and individual quote records in `seller_quote_history`. A new quote updates the current product price while preserving prior quote values and the round in which each was collected. Seller matching currently uses the phone number when available, then the listing URL, then the business name.
@@ -97,8 +95,3 @@ The prompt and tool payload examples are in [`prompts/negotiator-en.md`](prompts
 - `POST /webhooks/bolna` — Bolna call events.
 - `POST /bolna/tools/:name` — Bolna agent tools.
 
-## Scope and limitations
-
-This is a single-buyer application using SQLite and local recording storage. Seller discovery uses OpenAI web search; there are no direct IndiaMART or Justdial API integrations. Provider behavior, webhooks, regional-language handling, and recording downloads should be verified with the configured OpenAI and Bolna accounts before relying on them.
-
-The web console currently has no user authentication. Keep it on a trusted network and restrict access to any public tunnel.
